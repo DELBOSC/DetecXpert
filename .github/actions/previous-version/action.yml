@@ -1,5 +1,5 @@
 name: 'Previous Version Extractor'
-description: 'Extrait et analyse la version précédente de DetectXpert'
+description: 'Extrait la version précédente pour la gestion des releases'
 author: 'DetectXpert Team'
 
 permissions:
@@ -8,31 +8,43 @@ permissions:
 
 inputs:
   repo-token:
-    description: 'Token GitHub pour accéder aux versions et tags du dépôt'
     required: true
+    description: 'Token pour accéder au dépôt'
   skip-checkout:
-    description: 'Ignorer l''étape de checkout intégrée'
     required: false
     default: 'false'
-  # … autres inputs existants …
+    description: 'Ignorer le checkout intégré'
+  json-output:
+    required: false
+    default: 'false'
+    description: 'Générer un fichier JSON complet'
 
 outputs:
   previous-version:
-    description: 'La version précédente au format semver (x.y.z)'
+    description: 'Version précédente (x.y.z)'
   major:
     description: 'Composante majeure'
   minor:
     description: 'Composante mineure'
   patch:
     description: 'Composante patch'
-  # … autres outputs existants …
+  changelog-url:
+    description: 'URL des notes de version'
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Rendre le script exécutable
-      run: chmod +x ${{ github.action_path }}/previous-version.sh
-
-    - name: Exécuter Previous Version Extractor
+    - name: Checkout (if needed)
+      if: ${{ inputs.skip-checkout != 'true' }}
+      uses: actions/checkout@v4
+    - name: Prepare script
       shell: bash
-      run: ${{ github.action_path }}/previous-version.sh
+      run: |
+        chmod +x "${{ github.action_path }}/previous-version.sh"
+    - name: Extract previous version
+      id: prev
+      shell: bash
+      run: |
+        "${{ github.action_path }}/previous-version.sh" \
+          --repo-token "${{ inputs.repo-token }}" \
+          $([[ "${{ inputs.json-output }}" == "true" ]] && echo "--json")

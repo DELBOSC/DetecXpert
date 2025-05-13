@@ -1,19 +1,49 @@
 name: 'Validate Inputs'
-description: 'Valide les inputs fournis aux workflows DetectXpert'
-author: 'DetectXpert Team'
+description: 'Valide les inputs nécessaires pour les workflows DetectXpert'
+author: 'DetectXpert DevOps Team'
+repository: 'https://github.com/DELBOSC/DetectXpert'
+homepage: 'https://github.com/DELBOSC/DetectXpert/.github/actions/validate-inputs'
 
 inputs:
-  # … liste des inputs existants pour validate-inputs …
+  debug:
+    type: boolean
+    required: false
+    default: false
+    description: 'Active le mode debug'
+  environment:
+    type: string
+    required: true
+    default: 'development'
+    description: 'Environnement (development, staging, production)'
+  version:
+    type: string
+    required: true
+    description: 'Version SemVer (x.y.z)'
+  branch:
+    type: string
+    required: false
+    default: 'main'
+    description: 'Branche source pour le déploiement'
+
 outputs:
-  validated:
-    description: 'Booléen : inputs valides ou non'
+  is_valid:
+    description: 'true si toutes les validations passent'
+  errors:
+    description: 'Liste des erreurs détectées (vide si is_valid=true)'
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Rendre le script exécutable
-      run: chmod +x ${{ github.action_path }}/validate-inputs.sh
-
-    - name: Exécuter Validate Inputs
+    - name: Prepare
       shell: bash
-      run: ${{ github.action_path }}/validate-inputs.sh
+      run: |
+        chmod +x "${{ github.action_path }}/validate-inputs.sh"
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      run: |
+        "${{ github.action_path }}/validate-inputs.sh" \
+          --environment "${{ inputs.environment }}" \
+          --version     "${{ inputs.version }}" \
+          --branch      "${{ inputs.branch }}" \
+          $([[ "${{ inputs.debug }}" == "true" ]] && echo "--debug")

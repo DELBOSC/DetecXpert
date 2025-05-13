@@ -1,107 +1,101 @@
 name: 'Detect Environment'
 description: "Détecte les caractéristiques de l'environnement d'exécution pour les workflows DetectXpert"
 author: 'DetectXpert DevOps Team'
-repository: 'https://github.com/detectxpert/devops'
-homepage: 'https://github.com/detectxpert/devops/tree/main/.github/actions/detect-environment'
+repository: 'https://github.com/DELBOSC/DetectXpert'
+homepage: 'https://github.com/DELBOSC/DetectXpert/.github/actions/detect-environment'
 
-# Inputs et outputs inchangés (cf. original) :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
 inputs:
   debug:
     type: boolean
     required: false
-    description: 'Active le mode debug avec logs détaillés'
     default: false
+    description: 'Active le mode debug avec logs détaillés'
   verify_dependencies:
     type: boolean
     required: false
-    description: 'Vérifier la présence des dépendances requises'
     default: true
+    description: 'Vérifie la présence des dépendances requises'
   output_format:
     type: string
     required: false
-    description: "Format de sortie pour les outputs: json (default), yaml, ou text"
     default: 'json'
+    description: "Format de sortie pour les outputs: json, yaml ou text"
   detect_hardware:
     type: boolean
     required: false
-    description: 'Détecter les capacités matérielles (output: hardware_info)'
     default: true
+    description: 'Détecte les capacités matérielles (CPU, mémoire, disque)'
   detect_network:
     type: boolean
     required: false
-    description: 'Détecter les informations réseau (output: network_info)'
     default: false
+    description: 'Détecte les informations réseau'
   detect_dependencies:
     type: boolean
     required: false
-    description: 'Détecter les versions des dépendances logicielles (output: software_info)'
     default: true
+    description: 'Détecte les versions des dépendances logicielles'
   detect_github_context:
     type: boolean
     required: false
-    description: 'Détecter les informations contextuelles GitHub Actions (output: github_context)'
     default: true
+    description: 'Détecte le contexte GitHub Actions'
   required_dependencies:
     type: string
     required: false
-    description: 'Liste des dépendances à vérifier, séparées par des virgules (ex: jq,grep,xargs)'
     default: 'jq,grep,xargs'
+    description: 'Liste des dépendances à vérifier, séparées par des virgules'
   performance_test:
     type: boolean
     required: false
-    description: 'Effectuer des tests de performance simples (output: performance_metrics)'
     default: false
+    description: 'Effectue des tests de performance (CPU/disque)'
 
 outputs:
   os_info:
-    description: "Informations sur le système d'exploitation (nom, version, distribution)"
+    description: 'Infos système (OS, version, distro)'
     value: ${{ steps.detect.outputs.os_info }}
   hardware_info:
-    description: 'Informations sur le matériel (CPU, mémoire, disque)'
+    description: 'Infos matériel (CPU, mémoire, disque)'
     value: ${{ steps.detect.outputs.hardware_info }}
   software_info:
-    description: 'Informations sur les logiciels (versions des dépendances)'
+    description: 'Versions des dépendances logicielles'
     value: ${{ steps.detect.outputs.software_info }}
   github_context:
-    description: 'Informations sur le contexte GitHub Actions'
+    description: 'Contexte GitHub Actions'
     value: ${{ steps.detect.outputs.github_context }}
   network_info:
-    description: 'Informations sur la connectivité réseau'
+    description: 'Données de connectivité réseau'
     value: ${{ steps.detect.outputs.network_info }}
   performance_metrics:
-    description: 'Métriques de performance mesurées (si performance_test=true)'
+    description: 'Métriques de performance (si performance_test=true)'
     value: ${{ steps.detect.outputs.performance_metrics }}
   is_valid:
-    description: "Indique si l'environnement répond aux exigences minimales (booléen)"
+    description: 'Environnement valide (true/false)'
     value: ${{ steps.detect.outputs.is_valid }}
   validation_errors:
-    description: "Liste des problèmes détectés dans l'environnement"
+    description: 'Liste des problèmes détectés'
     value: ${{ steps.detect.outputs.validation_errors }}
   environment_id:
-    description: "Identifiant unique pour l'environnement détecté"
+    description: 'Identifiant unique de l’environnement'
     value: ${{ steps.detect.outputs.environment_id }}
   summary:
-    description: 'Résumé des informations détectées'
+    description: 'Résumé des informations essentielles'
     value: ${{ steps.detect.outputs.summary }}
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Rendre le script exécutable
-      run: chmod +x ${{ github.action_path }}/detect-environment.sh
-
-    - name: Valider le format de sortie
-      if: ${{ inputs.output_format != 'json' && inputs.output_format != 'yaml' && inputs.output_format != 'text' }}
+    - name: Check prerequisites
       shell: bash
       run: |
-        echo "::error::Format de sortie invalide : '${{ inputs.output_format }}'. Valeurs autorisées: json, yaml, text"
-        exit 1
-
-    - name: Détecter l'environnement
+        chmod +x "${{ github.action_path }}/detect-environment.sh"
+        command -v jq >/dev/null 2>&1 || { echo "::error::jq manquant"; exit 1; }
+    - name: Detect environment
       id: detect
       shell: bash
       env:
-        DETECT_INPUTS: ${{ toJSON(inputs) }}
         DETECT_DEBUG: ${{ inputs.debug }}
         DETECT_OUTPUT_FORMAT: ${{ inputs.output_format }}
-      run: ${{ github.action_path }}/detect-environment.sh
+      run: |
+        ${{ github.action_path }}/detect-environment.sh

@@ -1,32 +1,29 @@
-name: 'Version Info'
-description: 'Extrait et prépare les informations de version pour les workflows DetectXpert'
-author: 'DetectXpert Team'
-
-# (Inputs et outputs issus de la configuration originale de version-info) :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+name: 'Version Info Generator'
+description: 'Détermine la version courante et génère la matrice de build'
+author: 'DetectXpert DevOps Team'
 
 inputs:
-  # … votre liste d’inputs existants …
+  # vous n’avez normalement rien à configurer ici,
+  # ce bloc est pour exposer la composite action si besoin
+  dummy:
+    description: '(aucun paramètre requis)'
+    required: false
+
 outputs:
   version:
-    description: 'Version complète générée'
-  version_name:
-    description: 'Nom de version (sans préfixe/suffixe)'
-  version_code:
-    description: 'Numéro de build ou code de version'
-  major:       { description: 'Composante majeure' }
-  minor:       { description: 'Composante mineure' }
-  patch:       { description: 'Composante patch' }
-  is_snapshot: { description: 'Indique si c’est un snapshot' }
-  is_release:  { description: 'Indique si c’est une release' }
-  build_date:  { description: 'Date de build générée' }
-  git_commit:  { description: 'SHA du commit utilisé' }
+    description: 'Version calculée (x.y.z)'
+  matrix:
+    description: 'Matrice de plateformes pour le job de build'
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Rendre le script exécutable
-      run: chmod +x ${{ github.action_path }}/version-info.sh
-
-    - name: Exécuter Version Info
+    - name: Prepare script
       shell: bash
-      run: ${{ github.action_path }}/version-info.sh
+      run: |
+        chmod +x "${{ github.action_path }}/version-info.sh"
+    - name: Generate version & matrix
+      id: gen
+      shell: bash
+      run: |
+        "${{ github.action_path }}/version-info.sh"
