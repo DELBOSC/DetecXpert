@@ -1,6 +1,8 @@
 name: 'Matrix Configuration Generator'
 description: 'Génère une stratégie matrix dynamique pour CI/CD'
 author: 'DetectXpert DevOps Team'
+repository: 'https://github.com/DELBOSC/DetectXpert'
+homepage: 'https://github.com/DELBOSC/DetectXpert/.github/actions/matrix-config'
 
 inputs:
   platforms:
@@ -12,7 +14,7 @@ inputs:
     type: string
     required: false
     default: ''
-    description: 'versions d’OS (vide = valeurs par défaut par plateforme)'
+    description: 'Versions d’OS (virgule séparées, vide = valeurs par défaut)'
   include-flavors:
     type: boolean
     required: false
@@ -31,37 +33,35 @@ inputs:
 
 outputs:
   matrix:
-    description: 'Stratégie matrix JSON'
+    description: 'Stratégie matrix JSON complète'
   matrix-include:
     description: 'Combinaisons à inclure'
   matrix-exclude:
     description: 'Combinaisons à exclure'
   total-combinations:
-    description: 'Nombre total de combinaisons'
+    description: 'Nombre total de combinaisons générées'
 
 runs:
-  using: composite
+  using: 'composite'
   steps:
-    - name: Check prerequisites
+    - name: Rendre le script exécutable
+      shell: bash
+      run: chmod +x "${{ github.action_path }}/matrix_config.sh"
+
+    - name: Préparer les variables d’environnement
       shell: bash
       run: |
-        chmod +x "${{ github.action_path }}/matrix-config.sh"
-        command -v jq >/dev/null 2>&1 || { echo "::error::jq manquant"; exit 1; }
-    - name: Setup env
-      shell: bash
-      run: |
-        cat <<EOF >> $GITHUB_ENV
-PLATFORMS=${{ inputs.platforms }}
-OS_VERSIONS=${{ inputs.os-versions }}
-INCLUDE_FLAVORS=${{ inputs.include-flavors }}
-DIMENSIONS=${{ inputs.dimensions }}
-DEBUG=${{ inputs.debug }}
-EOF
-    - name: Generate matrix
+        echo "PLATFORMS=${{ inputs.platforms }}"      >> $GITHUB_ENV
+        echo "OS_VERSIONS=${{ inputs.os-versions }}"  >> $GITHUB_ENV
+        echo "INCLUDE_FLAVORS=${{ inputs.include-flavors }}" >> $GITHUB_ENV
+        echo "DIMENSIONS=${{ inputs.dimensions }}"    >> $GITHUB_ENV
+        echo "DEBUG=${{ inputs.debug }}"              >> $GITHUB_ENV
+
+    - name: Générer la matrice
       id: generate-matrix
       shell: bash
       run: |
-        "${{ github.action_path }}/matrix-config.sh" \
+        ${{ github.action_path }}/matrix_config.sh \
           --platforms        "$PLATFORMS" \
           --os-versions      "$OS_VERSIONS" \
           --include-flavors  "$INCLUDE_FLAVORS" \
