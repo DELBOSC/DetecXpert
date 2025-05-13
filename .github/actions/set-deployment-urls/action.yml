@@ -12,11 +12,11 @@ inputs:
       - staging
       - prod
   version:
-    description: 'Version ou tag du déploiement (format SemVer recommandé: x.y.z[-pré][+build])'
+    description: 'Version ou tag du déploiement (format SemVer recommandé : x.y.z[-pré][+build])'
     required: true
     type: string
   base-domain:
-    description: 'Domaine de base pour les URLs de déploiement (ex: detectxpert.com)'
+    description: 'Domaine de base pour les URLs de déploiement (ex : detectxpert.com)'
     required: false
     type: string
     default: 'detectxpert.com'
@@ -61,93 +61,3 @@ runs:
     - name: Exécuter le script Set Deployment URLs
       shell: bash
       run: ${{ github.action_path }}/set-deployment_urls.sh
-        
-        # Normalisation des entrées
-        ENVIRONMENT="${{ inputs.environment }}"
-        VERSION="${{ inputs.version }}"
-        BASE_DOMAIN="${{ inputs.base-domain }}"
-        INCLUDE_VERSION_IN_URL="$(normalize_bool "${{ inputs.include-version-in-url }}")"
-        CUSTOM_PREFIX="${{ inputs.custom-prefix }}"
-        USE_HTTPS="$(normalize_bool "${{ inputs.use-https }}")"
-        
-        # Validation de l'environnement
-        case "$ENVIRONMENT" in
-          dev|staging|prod) ;;
-          *) 
-            echo "::error::Environnement invalide: '$ENVIRONMENT' (dev, staging, prod)"
-            exit 1 
-            ;;
-        esac
-        
-        # Validation du préfixe personnalisé
-        if [[ "$CUSTOM_PREFIX" != "" && ! "$CUSTOM_PREFIX" =~ ^[a-z0-9-]+$ ]]; then
-          echo "::error::Le préfixe personnalisé doit uniquement contenir des lettres minuscules, chiffres et tirets"
-          exit 1
-        fi
-        
-        # Validation du nom de domaine
-        if [[ ! "$BASE_DOMAIN" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]]; then
-          echo "::error::Domaine de base invalide: '$BASE_DOMAIN'"
-          exit 1
-        fi
-        
-        # Validation du format SemVer complet
-        semver_regex='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-        if [[ ! "$VERSION" =~ $semver_regex ]]; then
-          echo "::warning::Format de version non SemVer complet (x.y.z[-pré][+build])"
-        fi
-        
-        # Déterminer le préfixe pour les URLs
-        PREFIX="${CUSTOM_PREFIX:-$ENVIRONMENT}"
-        
-        # Déterminer le protocole
-        PROTO="http"
-        if [[ "$USE_HTTPS" == "true" ]]; then
-          PROTO="https"
-        fi
-        
-        # Fonction de construction d'URL
-        build_url() {
-          local subdomain="$1" # "", "api", "dashboard", "docs"
-          local host
-          
-          # Construire le hostname
-          if [[ -n "$subdomain" ]]; then
-            host="${subdomain}.${PREFIX}.${BASE_DOMAIN}"
-          else
-            host="${PREFIX}.${BASE_DOMAIN}"
-          fi
-          
-          # Ajouter le chemin avec version si nécessaire
-          local path=""
-          if [[ "$INCLUDE_VERSION_IN_URL" == "true" && -n "$VERSION" ]]; then
-            path="/v${VERSION}/"
-          else
-            path="/"
-          fi
-          
-          echo "${PROTO}://${host}${path}"
-        }
-        
-        # Générer les URLs
-        MAIN_URL=$(build_url "")
-        API_URL=$(build_url "api")
-        DASHBOARD_URL=$(build_url "dashboard")
-        DOCS_URL=$(build_url "docs")
-        
-        # Générer un ID de déploiement unique
-        DEPLOYMENT_ID="${PREFIX}-${VERSION}-$(date +%Y%m%d%H%M%S)"
-        
-        # Afficher les URLs pour le débogage
-        echo "Main URL: $MAIN_URL"
-        echo "API URL: $API_URL"
-        echo "Dashboard URL: $DASHBOARD_URL"
-        echo "Docs URL: $DOCS_URL"
-        echo "Deployment ID: $DEPLOYMENT_ID"
-        
-        # Définir les outputs pour GitHub Actions
-        echo "main-url=${MAIN_URL}" >> $GITHUB_OUTPUT
-        echo "api-url=${API_URL}" >> $GITHUB_OUTPUT
-        echo "dashboard-url=${DASHBOARD_URL}" >> $GITHUB_OUTPUT
-        echo "docs-url=${DOCS_URL}" >> $GITHUB_OUTPUT
-        echo "deployment-id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
