@@ -1,6 +1,6 @@
 name: CI DetectXpert
 
-# ─── Déclencheurs ───────────────────────────────────────────────────────────────
+# ─── 1. Déclencheurs ───────────────────────────────────────────────────────────────
 on:
   push:
     branches:
@@ -12,14 +12,14 @@ on:
       - develop
   workflow_dispatch:
 
-# ─── Permissions ────────────────────────────────────────────────────────────────
+# ─── 2. Permissions ────────────────────────────────────────────────────────────────
 permissions:
   contents: read
   id-token: write
 
-# ─── Jobs ──────────────────────────────────────────────────────────────────────
+# ─── 3. Jobs ──────────────────────────────────────────────────────────────────────
 jobs:
-  # 1. Validation de l’environnement
+  # 3.1 Validation de l’environnement
   detect-environment:
     name: Détecter l’environnement
     runs-on: ubuntu-latest
@@ -37,7 +37,7 @@ jobs:
           detect_network: false
           output_format: json
 
-  # 2. Génération de la matrice de tests
+  # 3.2 Génération de la matrice de tests
   generate-matrix:
     name: Générer la matrice
     needs: detect-environment
@@ -54,11 +54,13 @@ jobs:
         id: matrix
         uses: ./.github/actions/matrix-config
         with:
-          platforms:   android,web
-          os-versions: ubuntu-latest,macos-latest
+          # liste des plateformes
+          platforms:       android,web
+          # mapping plateforme:OS
+          os-versions:     android:ubuntu-latest,web:macos-latest
           include-flavors: false
 
-  # 3. Linting
+  # 3.3 Lint du code
   lint:
     name: Lint du code
     needs: generate-matrix
@@ -75,7 +77,7 @@ jobs:
           npm ci
           npm run lint
 
-  # 4. Tests unitaires et E2E
+  # 3.4 Tests unitaires & E2E
   test:
     name: Tests
     needs: generate-matrix
@@ -111,17 +113,18 @@ jobs:
           npm ci
           npm test
 
-  # 5. Build complet
+  # 3.5 Assemblage complet
   build:
     name: Assemblage
     needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Assemble tout
         run: ./gradlew assemble
 
-  # 6. Rapport de couverture
+  # 3.6 Rapport de couverture
   coverage:
     name: Couverture de code
     needs: test
@@ -129,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generer Jacoco
+      - name: Générer Jacoco
         run: ./gradlew jacocoTestReport
 
       - name: Publier rapport
@@ -138,7 +141,7 @@ jobs:
           name: coverage-report
           path: '**/build/reports/jacoco/test/html'
 
-  # 7. Analyse SonarCloud
+  # 3.7 Analyse SonarCloud
   sonar:
     name: SonarCloud Scan
     needs: build
