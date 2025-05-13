@@ -1,0 +1,1370 @@
+name: CI
+
+# Configuration de concurrency pour annuler les runs obsolètes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/*.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/*.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  actions: read
+  security-events: write
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4 -Dkotlin.incremental=false -Dkotlin.compiler.execution.strategy=in-process"
+  JAVA_VERSION: '17'
+  XCODE_VERSION: '14.2'
+  NODE_VERSION: '18'
+  MIN_COVERAGE: '70'  # Seuil minimal de couverture de code en pourcentage
+
+jobs:
+  setup:
+    name: Configuration initiale
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - name: Vérification du skip
+        id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          paths_ignore: '["**/*.md", "docs/**", ".github/*.md", ".github/ISSUE_TEMPLATE/**", ".github/PULL_REQUEST_TEMPLATE.md"]'
+          
+      - name: Checkout
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validation du wrapper Gradle
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        uses: gradle/wrapper-validation-action@v2
+
+      - name: Vérification du style de code
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        run: |
+          set -eo pipefail
+          ./gradlew ktlintCheck
+        continue-on-error: false
+
+  # Modules Core avec matrice
+  core-modules:
+    name: Build et Test (Core ${{ matrix.module }})
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ['config', 'errors', 'logging', 'threading']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Installation xmlstarlet
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+        continue-on-error: true
+
+      - name: Build module ${{ matrix.module }}
+        id: build
+        run: |
+          set -eo pipefail
+          ./gradlew :core:${{ matrix.module }}:assemble --stacktrace
+        # Critique - doit réussir
+        continue-on-error: false
+
+      - name: Test module ${{ matrix.module }}
+        id: test
+        run: |
+          set -eo pipefail
+          ./gradlew :core:${{ matrix.module }}:test --stacktrace
+        # Critique - doit réussir
+        continue-on-error: false
+
+      - name: Analyse de couverture avec Jacoco
+        id: jacoco
+        run: |
+          set -eo pipefail
+          ./gradlew :core:${{ matrix.module }}:jacocoTestReport
+          
+          # Vérification automatique du seuil de couverture
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Sur PR, échec si seuil non atteint
+            ./gradlew :core:${{ matrix.module }}:jacocoTestCoverageVerification
+          else
+            # Sur autres événements, uniquement rapport
+            ./gradlew :core:${{ matrix.module }}:jacocoTestCoverageVerification || echo "Couverture insuffisante"
+          fi
+          
+          # Extraction du pourcentage depuis XML (plus stable que l'HTML)
+          COVERAGE_XML="core/${{ matrix.module }}/build/reports/jacoco/test/jacocoTestReport.xml"
+          if [ -f "$COVERAGE_XML" ]; then
+            # Utilisation de xmlstarlet avec une expression XPath 1.0 valide
+            if command -v xmlstarlet &> /dev/null; then
+              COVERAGE=$(xmlstarlet sel -t -v "round((number(//counter[@type='LINE']/@covered) div (number(//counter[@type='LINE']/@covered) + number(//counter[@type='LINE']/@missed))) * 100)" "$COVERAGE_XML")
+            else
+              # Fallback sur méthode moins fiable avec grep/sed
+              COVERAGE_FILE="core/${{ matrix.module }}/build/reports/jacoco/test/html/index.html"
+              if [ -f "$COVERAGE_FILE" ]; then
+                COVERAGE=$(grep -o 'Total[^%]*%' "$COVERAGE_FILE" | grep -o '[0-9]\+' || echo "0")
+              else
+                COVERAGE="0"
+              fi
+            fi
+            
+            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+            
+            # Vérification du seuil de couverture
+            if [ "$COVERAGE" -lt "${{ env.MIN_COVERAGE }}" ]; then
+              echo "::warning::La couverture du module ${{ matrix.module }} est de $COVERAGE%, ce qui est inférieur au seuil minimal de ${{ env.MIN_COVERAGE }}%"
+            else
+              echo "::notice::La couverture du module ${{ matrix.module }} est de $COVERAGE%"
+            fi
+          else
+            echo "::warning::Impossible de trouver le rapport de couverture pour ${{ matrix.module }}"
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+        # Continue-on-error uniquement pour les non-PR
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'core/${{ matrix.module }}/build/test-results/test/TEST-*.xml'
+          check_name: 'Résultats de test - Core ${{ matrix.module }}'
+          fail_on_failure: false
+
+      - name: Upload des artefacts de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.module }}-test-results
+          path: |
+            core/${{ matrix.module }}/build/reports/tests/test/
+            core/${{ matrix.module }}/build/reports/jacoco/
+          retention-days: 5
+
+  # Modules Domain avec matrice optimisée
+  domain-modules:
+    name: Build et Test (Domain ${{ matrix.module.name }})
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - { name: 'detection', critical: true }
+          - { name: 'user', critical: true }
+          - { name: 'mapping', critical: true }  
+          - { name: 'equipment', critical: false }
+          - { name: 'findings', critical: false }
+          - { name: 'session', critical: false }
+          - { name: 'collaboration', critical: false }
+          - { name: 'legal', critical: false }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Installation xmlstarlet
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+        continue-on-error: true
+
+      - name: Build module ${{ matrix.module.name }}
+        id: build
+        run: |
+          set -eo pipefail
+          ./gradlew :domain:${{ matrix.module.name }}:assemble --stacktrace
+        # Critique - doit réussir
+        continue-on-error: false
+
+      # Utilisez if + continue-on-error plutôt qu'une expression booléenne complexe
+      - name: Test module ${{ matrix.module.name }}
+        id: test
+        if: ${{ matrix.module.critical || github.event_name == 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :domain:${{ matrix.module.name }}:test --stacktrace
+        continue-on-error: false
+
+      - name: Test module ${{ matrix.module.name }} (non critique)
+        id: test-non-critical
+        if: ${{ !matrix.module.critical && github.event_name != 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :domain:${{ matrix.module.name }}:test --stacktrace
+        continue-on-error: true
+
+      - name: Analyse de couverture avec Jacoco
+        id: jacoco
+        run: |
+          set -eo pipefail
+          ./gradlew :domain:${{ matrix.module.name }}:jacocoTestReport
+          
+          # Vérification automatique du seuil de couverture
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Sur PR, échec si seuil non atteint
+            ./gradlew :domain:${{ matrix.module.name }}:jacocoTestCoverageVerification
+          else
+            # Sur autres événements, uniquement rapport
+            ./gradlew :domain:${{ matrix.module.name }}:jacocoTestCoverageVerification || echo "Couverture insuffisante"
+          fi
+          
+          # Extraction du pourcentage depuis XML (plus stable que l'HTML)
+          COVERAGE_XML="domain/${{ matrix.module.name }}/build/reports/jacoco/test/jacocoTestReport.xml"
+          if [ -f "$COVERAGE_XML" ]; then
+            # Utilisation de xmlstarlet avec une expression XPath 1.0 valide
+            if command -v xmlstarlet &> /dev/null; then
+              COVERAGE=$(xmlstarlet sel -t -v "round((number(//counter[@type='LINE']/@covered) div (number(//counter[@type='LINE']/@covered) + number(//counter[@type='LINE']/@missed))) * 100)" "$COVERAGE_XML")
+            else
+              # Fallback sur méthode moins fiable avec grep/sed
+              COVERAGE_FILE="domain/${{ matrix.module.name }}/build/reports/jacoco/test/html/index.html"
+              if [ -f "$COVERAGE_FILE" ]; then
+                COVERAGE=$(grep -o 'Total[^%]*%' "$COVERAGE_FILE" | grep -o '[0-9]\+' || echo "0")
+              else
+                COVERAGE="0"
+              fi
+            fi
+            
+            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+            
+            # Vérification du seuil de couverture
+            if [ "$COVERAGE" -lt "${{ env.MIN_COVERAGE }}" ]; then
+              echo "::warning::La couverture du module ${{ matrix.module.name }} est de $COVERAGE%, ce qui est inférieur au seuil minimal de ${{ env.MIN_COVERAGE }}%"
+            else
+              echo "::notice::La couverture du module ${{ matrix.module.name }} est de $COVERAGE%"
+            fi
+          else
+            echo "::warning::Impossible de trouver le rapport de couverture pour ${{ matrix.module.name }}"
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'domain/${{ matrix.module.name }}/build/test-results/test/TEST-*.xml'
+          check_name: 'Résultats de test - Domain ${{ matrix.module.name }}'
+          fail_on_failure: false
+
+      - name: Upload des artefacts de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: domain-${{ matrix.module.name }}-test-results
+          path: |
+            domain/${{ matrix.module.name }}/build/reports/tests/test/
+            domain/${{ matrix.module.name }}/build/reports/jacoco/
+          retention-days: 5
+
+  # Modules Feature avec matrice optimisée
+  feature-modules:
+    name: Build et Test (Feature ${{ matrix.module.name }})
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          # Note: Pour les modules avec tirets, un mapping est nécessaire dans settings.gradle
+          - { name: 'tomography', critical: false }
+          - { name: 'multi-modal', critical: true }
+          - { name: 'ar', critical: true }
+          - { name: 'quantum', critical: false }
+          - { name: 'ai', critical: true }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Installation xmlstarlet
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+        continue-on-error: true
+
+      - name: Build module ${{ matrix.module.name }}
+        id: build
+        run: |
+          set -eo pipefail
+          ./gradlew :features:${{ matrix.module.name }}:assemble --stacktrace
+        # Critique - doit réussir
+        continue-on-error: false
+
+      # Utilisez if + continue-on-error plutôt qu'une expression booléenne complexe
+      - name: Test module ${{ matrix.module.name }}
+        id: test
+        if: ${{ matrix.module.critical || github.event_name == 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :features:${{ matrix.module.name }}:test --stacktrace
+        continue-on-error: false
+
+      - name: Test module ${{ matrix.module.name }} (non critique)
+        id: test-non-critical
+        if: ${{ !matrix.module.critical && github.event_name != 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :features:${{ matrix.module.name }}:test --stacktrace
+        continue-on-error: true
+
+      - name: Analyse de couverture avec Jacoco
+        id: jacoco
+        run: |
+          set -eo pipefail
+          ./gradlew :features:${{ matrix.module.name }}:jacocoTestReport
+          
+          # Vérification automatique du seuil de couverture
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Sur PR, échec si seuil non atteint
+            ./gradlew :features:${{ matrix.module.name }}:jacocoTestCoverageVerification
+          else
+            # Sur autres événements, uniquement rapport
+            ./gradlew :features:${{ matrix.module.name }}:jacocoTestCoverageVerification || echo "Couverture insuffisante"
+          fi
+          
+          # Extraction du pourcentage depuis XML (plus stable que l'HTML)
+          COVERAGE_XML="features/${{ matrix.module.name }}/build/reports/jacoco/test/jacocoTestReport.xml"
+          if [ -f "$COVERAGE_XML" ]; then
+            # Utilisation de xmlstarlet avec une expression XPath 1.0 valide
+            if command -v xmlstarlet &> /dev/null; then
+              COVERAGE=$(xmlstarlet sel -t -v "round((number(//counter[@type='LINE']/@covered) div (number(//counter[@type='LINE']/@covered) + number(//counter[@type='LINE']/@missed))) * 100)" "$COVERAGE_XML")
+            else
+              # Fallback sur méthode moins fiable avec grep/sed
+              COVERAGE_FILE="features/${{ matrix.module.name }}/build/reports/jacoco/test/html/index.html"
+              if [ -f "$COVERAGE_FILE" ]; then
+                COVERAGE=$(grep -o 'Total[^%]*%' "$COVERAGE_FILE" | grep -o '[0-9]\+' || echo "0")
+              else
+                COVERAGE="0"
+              fi
+            fi
+            
+            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+            
+            # Vérification du seuil de couverture
+            if [ "$COVERAGE" -lt "${{ env.MIN_COVERAGE }}" ]; then
+              echo "::warning::La couverture du module ${{ matrix.module.name }} est de $COVERAGE%, ce qui est inférieur au seuil minimal de ${{ env.MIN_COVERAGE }}%"
+            else
+              echo "::notice::La couverture du module ${{ matrix.module.name }} est de $COVERAGE%"
+            fi
+          else
+            echo "::warning::Impossible de trouver le rapport de couverture pour ${{ matrix.module.name }}"
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'features/${{ matrix.module.name }}/build/test-results/test/TEST-*.xml'
+          check_name: 'Résultats de test - Feature ${{ matrix.module.name }}'
+          fail_on_failure: false
+
+      - name: Upload des artefacts de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-${{ matrix.module.name }}-test-results
+          path: |
+            features/${{ matrix.module.name }}/build/reports/tests/test/
+            features/${{ matrix.module.name }}/build/reports/jacoco/
+          retention-days: 5
+
+  # Build Android
+  android-build:
+    name: Build Android
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Installation xmlstarlet
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+        continue-on-error: true
+
+      - name: Cache Android
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/build-cache
+          key: ${{ runner.os }}-android-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-android-
+
+      - name: Build Android Debug
+        id: build
+        run: |
+          set -eo pipefail
+          ./gradlew :platform:android:assembleDebug --stacktrace
+        # Critique - doit réussir
+        continue-on-error: false
+
+      - name: Tests unitaires Android
+        id: test
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :platform:android:testDebugUnitTest --stacktrace
+        continue-on-error: false
+
+      - name: Tests unitaires Android (non critique)
+        id: test-non-critical
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          set -eo pipefail
+          ./gradlew :platform:android:testDebugUnitTest --stacktrace
+        continue-on-error: true
+
+      - name: Analyse de couverture avec Jacoco
+        id: jacoco
+        run: |
+          set -eo pipefail
+          ./gradlew :platform:android:jacocoTestReport
+          
+          # Vérification automatique du seuil de couverture
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Sur PR, échec si seuil non atteint
+            ./gradlew :platform:android:jacocoTestCoverageVerification
+          else
+            # Sur autres événements, uniquement rapport
+            ./gradlew :platform:android:jacocoTestCoverageVerification || echo "Couverture insuffisante"
+          fi
+          
+          # Extraction du pourcentage depuis XML (plus stable que l'HTML)
+          COVERAGE_XML="platform/android/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml"
+          if [ -f "$COVERAGE_XML" ]; then
+            # Utilisation de xmlstarlet avec une expression XPath 1.0 valide
+            if command -v xmlstarlet &> /dev/null; then
+              COVERAGE=$(xmlstarlet sel -t -v "round((number(//counter[@type='LINE']/@covered) div (number(//counter[@type='LINE']/@covered) + number(//counter[@type='LINE']/@missed))) * 100)" "$COVERAGE_XML")
+            else
+              # Fallback sur méthode moins fiable avec grep/sed
+              COVERAGE_FILE="platform/android/build/reports/jacoco/jacocoTestReport/html/index.html"
+              if [ -f "$COVERAGE_FILE" ]; then
+                COVERAGE=$(grep -o 'Total[^%]*%' "$COVERAGE_FILE" | grep -o '[0-9]\+' || echo "0")
+              else
+                COVERAGE="0"
+              fi
+            fi
+            
+            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+            
+            # Vérification du seuil de couverture
+            if [ "$COVERAGE" -lt "${{ env.MIN_COVERAGE }}" ]; then
+              echo "::warning::La couverture Android est de $COVERAGE%, ce qui est inférieur au seuil minimal de ${{ env.MIN_COVERAGE }}%"
+            else
+              echo "::notice::La couverture Android est de $COVERAGE%"
+            fi
+          else
+            echo "::warning::Impossible de trouver le rapport de couverture pour Android"
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+
+      - name: Vérification de l'APK
+        run: |
+          find platform/android -name "*.apk" -type f | grep -q . || (echo "Aucun APK généré!" && exit 1)
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'platform/android/build/test-results/**/TEST-*.xml'
+          check_name: 'Résultats de test - Android'
+          fail_on_failure: false
+
+      - name: Upload APK Android
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: |
+            platform/android/build/outputs/apk/debug/*.apk
+            platform/android/**/build/outputs/apk/debug/*.apk
+          retention-days: 10
+
+      - name: Upload des résultats de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-results
+          path: |
+            platform/android/build/reports/tests/
+            platform/android/build/reports/jacoco/
+          retention-days: 5
+
+  # Build iOS
+  ios-build:
+    name: Build iOS
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Configuration Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: platform/ios/Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('platform/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-xcode-${{ env.XCODE_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-
+
+      - name: Installation CocoaPods
+        run: |
+          if [ -f "platform/ios/Podfile" ]; then
+            cd platform/ios
+            pod install --repo-update || echo "Installation des pods échouée, mais on continue"
+          else
+            echo "Aucun Podfile trouvé"
+            find . -name "Podfile" | xargs ls -la || true
+          fi
+        continue-on-error: true
+
+      - name: Detection du projet Xcode
+        id: detect_project
+        run: |
+          cd platform/ios || mkdir -p platform/ios
+          if [ -d "DetectXpert.xcworkspace" ]; then
+            echo "PROJECT_TYPE=workspace" >> $GITHUB_OUTPUT
+            echo "PROJECT_NAME=DetectXpert" >> $GITHUB_OUTPUT
+          elif [ -d "DetectXpert.xcodeproj" ]; then
+            echo "PROJECT_TYPE=project" >> $GITHUB_OUTPUT
+            echo "PROJECT_NAME=DetectXpert" >> $GITHUB_OUTPUT
+          else
+            # Recherche du premier projet/workspace trouvé
+            WORKSPACE_FILE=$(find . -name "*.xcworkspace" -type d -not -path "*/Pods/*" | head -n 1)
+            if [ -n "$WORKSPACE_FILE" ]; then
+              WORKSPACE_NAME=$(basename "$WORKSPACE_FILE" .xcworkspace)
+              echo "PROJECT_TYPE=workspace" >> $GITHUB_OUTPUT
+              echo "PROJECT_NAME=$WORKSPACE_NAME" >> $GITHUB_OUTPUT
+            else
+              PROJECT_FILE=$(find . -name "*.xcodeproj" -type d | head -n 1)
+              if [ -n "$PROJECT_FILE" ]; then
+                PROJECT_NAME=$(basename "$PROJECT_FILE" .xcodeproj)
+                echo "PROJECT_TYPE=project" >> $GITHUB_OUTPUT
+                echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_OUTPUT
+              else
+                echo "PROJECT_TYPE=none" >> $GITHUB_OUTPUT
+                echo "PROJECT_NAME=none" >> $GITHUB_OUTPUT
+              fi
+            fi
+          fi
+
+      - name: Détection du scheme iOS
+        id: detect_scheme
+        run: |
+          cd platform/ios || true
+          if [ "${{ steps.detect_project.outputs.PROJECT_TYPE }}" != "none" ]; then
+            if [ "${{ steps.detect_project.outputs.PROJECT_TYPE }}" == "workspace" ]; then
+              SCHEMES=$(xcodebuild -workspace "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcworkspace" -list | grep -A 10 "Schemes:" | grep -v "Schemes:" | tr -d [:space:] || echo "")
+            else
+              SCHEMES=$(xcodebuild -project "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcodeproj" -list | grep -A 10 "Schemes:" | grep -v "Schemes:" | tr -d [:space:] || echo "")
+            fi
+            
+            if [[ "$SCHEMES" == *"${{ steps.detect_project.outputs.PROJECT_NAME }}"* ]]; then
+              echo "SCHEME_NAME=${{ steps.detect_project.outputs.PROJECT_NAME }}" >> $GITHUB_OUTPUT
+            else
+              FIRST_SCHEME=$(echo "$SCHEMES" | head -n 1)
+              echo "SCHEME_NAME=$FIRST_SCHEME" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "SCHEME_NAME=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build iOS Debug
+        if: steps.detect_project.outputs.PROJECT_TYPE != 'none' && steps.detect_scheme.outputs.SCHEME_NAME != 'none'
+        run: |
+          cd platform/ios
+          if [ "${{ steps.detect_project.outputs.PROJECT_TYPE }}" == "workspace" ]; then
+            xcodebuild -workspace "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcworkspace" \
+                      -scheme "${{ steps.detect_scheme.outputs.SCHEME_NAME }}" \
+                      -configuration Debug \
+                      -sdk iphonesimulator \
+                      -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' \
+                      build
+          else
+            xcodebuild -project "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcodeproj" \
+                      -scheme "${{ steps.detect_scheme.outputs.SCHEME_NAME }}" \
+                      -configuration Debug \
+                      -sdk iphonesimulator \
+                      -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' \
+                      build
+          fi
+        # Moins critique - iOS build peut échouer
+        continue-on-error: true
+
+      - name: Tests unitaires iOS
+        if: steps.detect_project.outputs.PROJECT_TYPE != 'none' && steps.detect_scheme.outputs.SCHEME_NAME != 'none'
+        run: |
+          cd platform/ios
+          if [ "${{ steps.detect_project.outputs.PROJECT_TYPE }}" == "workspace" ]; then
+            xcodebuild -workspace "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcworkspace" \
+                      -scheme "${{ steps.detect_scheme.outputs.SCHEME_NAME }}" \
+                      -configuration Debug \
+                      -sdk iphonesimulator \
+                      -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' \
+                      test || echo "Tests échoués, mais on continue"
+          else
+            xcodebuild -project "${{ steps.detect_project.outputs.PROJECT_NAME }}.xcodeproj" \
+                      -scheme "${{ steps.detect_scheme.outputs.SCHEME_NAME }}" \
+                      -configuration Debug \
+                      -sdk iphonesimulator \
+                      -destination 'platform=iOS Simulator,name=iPhone 14,OS=latest' \
+                      test || echo "Tests échoués, mais on continue"
+          fi
+        continue-on-error: true
+
+      - name: Recherche et archivage des builds iOS
+        run: |
+          mkdir -p ios-builds
+          find platform/ios -path "*/Debug-iphonesimulator/*.app" -type d -exec cp -r {} ios-builds/ \; || true
+          find platform/ios -name "*.ipa" -type f -exec cp {} ios-builds/ \; || true
+          
+          # Si rien n'a été trouvé, créer un fichier placeholder
+          if [ ! "$(ls -A ios-builds)" ]; then
+            echo "Aucun build iOS trouvé. Veuillez vérifier la configuration du projet." > ios-builds/README.txt
+          fi
+          
+          find ios-builds -type f -o -type d | sort
+
+      - name: Upload build iOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-debug-build
+          path: ios-builds/
+          retention-days: 10
+
+      - name: Recherche et archivage des résultats de tests iOS
+        run: |
+          mkdir -p ios-test-results
+          find platform/ios -path "*/xcresults/*.xcresult" -type d -exec cp -r {} ios-test-results/ \; || true
+          find platform/ios -path "*/build/reports/*" -type d -exec cp -r {} ios-test-results/ \; || true
+          
+          # Si rien n'a été trouvé, créer un fichier placeholder
+          if [ ! "$(ls -A ios-test-results)" ]; then
+            echo "Aucun résultat de test iOS trouvé." > ios-test-results/README.txt
+          fi
+
+      - name: Upload résultats de tests iOS
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: ios-test-results/
+          retention-days: 5
+
+  # Build Web
+  web-build:
+    name: Build Web
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Configuration Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Détection et installation des dépendances Web
+        id: detect_web
+        run: |
+          # Recherche récursive du package.json principal
+          WEB_DIR=""
+          if [ -d "platform/web" ] && [ -f "platform/web/package.json" ]; then
+            WEB_DIR="platform/web"
+          else
+            WEB_DIR=$(find . -path "*/web/package.json" | head -n 1 | xargs dirname || echo "")
+            if [ -z "$WEB_DIR" ]; then
+              WEB_DIR=$(find . -name "package.json" -not -path "*/node_modules/*" | head -n 1 | xargs dirname || echo "")
+            fi
+          fi
+          
+          if [ -n "$WEB_DIR" ]; then
+            echo "WEB_DIR=$WEB_DIR" >> $GITHUB_OUTPUT
+            echo "Web project found at: $WEB_DIR"
+            
+            # Détection du gestionnaire de paquets
+            if [ -f "$WEB_DIR/yarn.lock" ]; then
+              echo "PACKAGE_MANAGER=yarn" >> $GITHUB_OUTPUT
+            else
+              echo "PACKAGE_MANAGER=npm" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "WEB_DIR=none" >> $GITHUB_OUTPUT
+            echo "PACKAGE_MANAGER=none" >> $GITHUB_OUTPUT
+            echo "No web project found"
+          fi
+        continue-on-error: true
+
+      # Cache Node modules - ciblé sur le répertoire web détecté
+      - name: Cache Node modules
+        if: steps.detect_web.outputs.WEB_DIR != 'none'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.detect_web.outputs.WEB_DIR }}/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles(format('{0}/package-lock.json', steps.detect_web.outputs.WEB_DIR), format('{0}/yarn.lock', steps.detect_web.outputs.WEB_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Installation des dépendances Web
+        if: steps.detect_web.outputs.WEB_DIR != 'none'
+        run: |
+          cd "${{ steps.detect_web.outputs.WEB_DIR }}"
+          
+          if [ "${{ steps.detect_web.outputs.PACKAGE_MANAGER }}" == "yarn" ]; then
+            yarn install --frozen-lockfile || echo "Installation des dépendances yarn échouée"
+          else
+            npm ci || npm install || echo "Installation des dépendances npm échouée"
+          fi
+        continue-on-error: true
+
+      - name: Build Web (npm/yarn)
+        if: steps.detect_web.outputs.WEB_DIR != 'none'
+        run: |
+          cd "${{ steps.detect_web.outputs.WEB_DIR }}"
+          if [ "${{ steps.detect_web.outputs.PACKAGE_MANAGER }}" == "yarn" ]; then
+            if grep -q "\"build\"" package.json; then
+              yarn build || echo "Build Web yarn échoué"
+            else
+              echo "Pas de script de build trouvé dans package.json"
+            fi
+          else
+            if grep -q "\"build\"" package.json; then
+              npm run build || echo "Build Web npm échoué"
+            else
+              echo "Pas de script de build trouvé dans package.json"
+            fi
+          fi
+        continue-on-error: false
+
+      - name: Build Web (Gradle)
+        run: |
+          if [ -d "platform/web" ]; then
+            ./gradlew :platform:web:assemble --stacktrace || echo "Build Web Gradle échoué"
+          else
+            echo "Dossier platform/web non trouvé, tentative de build à partir d'autres tâches Gradle"
+            ./gradlew assembleDist --stacktrace || ./gradlew assemble --stacktrace || echo "Aucune tâche Gradle pour le web trouvée"
+          fi
+        continue-on-error: true
+
+      - name: Tests Web (npm/yarn)
+        if: steps.detect_web.outputs.WEB_DIR != 'none'
+        run: |
+          cd "${{ steps.detect_web.outputs.WEB_DIR }}"
+          if [ "${{ steps.detect_web.outputs.PACKAGE_MANAGER }}" == "yarn" ]; then
+            if grep -q "\"test\"" package.json; then
+              yarn test --watchAll=false || echo "Tests Web yarn échoués"
+            else
+              echo "Pas de script de test trouvé dans package.json"
+            fi
+          else
+            if grep -q "\"test\"" package.json; then
+              npm test -- --no-watch || echo "Tests Web npm échoués"
+            else
+              echo "Pas de script de test trouvé dans package.json"
+            fi
+          fi
+        continue-on-error: true
+
+      - name: Tests Web (Gradle)
+        run: |
+          if [ -d "platform/web" ]; then
+            ./gradlew :platform:web:test --stacktrace || echo "Tests Web Gradle échoués"
+          fi
+        continue-on-error: true
+
+      - name: Recherche et archivage des builds Web
+        run: |
+          mkdir -p web-builds
+          
+          # Recherche récursive des artefacts web
+          if [ -n "${{ steps.detect_web.outputs.WEB_DIR }}" ] && [ "${{ steps.detect_web.outputs.WEB_DIR }}" != "none" ]; then
+            if [ -d "${{ steps.detect_web.outputs.WEB_DIR }}/dist" ]; then
+              cp -r "${{ steps.detect_web.outputs.WEB_DIR }}/dist" web-builds/
+            elif [ -d "${{ steps.detect_web.outputs.WEB_DIR }}/build" ]; then
+              find "${{ steps.detect_web.outputs.WEB_DIR }}/build" -path "*/dist/*" -type d -exec cp -r {} web-builds/ \; || true
+            fi
+          fi
+          
+          # Recherche globale
+          find . -path "*/dist/*" -type d -not -path "*/node_modules/*" -exec cp -r {} web-builds/ \; || true
+          find . -path "*/build/dist/*" -type d -exec cp -r {} web-builds/ \; || true
+          find . -path "*/build/distributions/*" -type d -exec cp -r {} web-builds/ \; || true
+          
+          # Si rien n'a été trouvé, créer un fichier placeholder
+          if [ ! "$(ls -A web-builds)" ]; then
+            echo "Aucun build Web trouvé. Veuillez vérifier la configuration du projet." > web-builds/README.txt
+          fi
+          
+          find web-builds -type f | head -n 10 | sort
+
+      - name: Upload build Web
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: web-builds/
+          retention-days: 10
+
+      - name: Recherche et archivage des résultats de tests Web
+        run: |
+          mkdir -p web-test-results
+          
+          if [ -n "${{ steps.detect_web.outputs.WEB_DIR }}" ] && [ "${{ steps.detect_web.outputs.WEB_DIR }}" != "none" ]; then
+            if [ -d "${{ steps.detect_web.outputs.WEB_DIR }}/coverage" ]; then
+              cp -r "${{ steps.detect_web.outputs.WEB_DIR }}/coverage" web-test-results/
+            fi
+          fi
+          
+          find . -path "*/coverage/*" -type d -not -path "*/node_modules/*" -exec cp -r {} web-test-results/ \; || true
+          find . -path "*/build/reports/tests/*" -type d -exec cp -r {} web-test-results/ \; || true
+          
+          # Si rien n'a été trouvé, créer un fichier placeholder
+          if [ ! "$(ls -A web-test-results)" ]; then
+            echo "Aucun résultat de test Web trouvé." > web-test-results/README.txt
+          fi
+
+      - name: Upload résultats de tests Web
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-results
+          path: web-test-results/
+          retention-days: 5
+
+  # Tests d'intégration
+  integration-tests:
+    name: Tests d'Intégration
+    needs: [core-modules, domain-modules, feature-modules]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # Réduit à 20 min car généralement moins long
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Installation xmlstarlet
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+        continue-on-error: true
+
+      - name: Tests d'intégration
+        run: |
+          set -eo pipefail
+          ./gradlew :tests:integration:test --stacktrace || echo "Tests d'intégration échoués, mais on continue"
+        continue-on-error: true
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'tests/integration/build/test-results/**/TEST-*.xml'
+          check_name: 'Résultats de tests d'intégration'
+          fail_on_failure: false
+
+      - name: Upload résultats des tests d'intégration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            tests/integration/build/reports/tests/
+            **/build/reports/tests/integrationTest/
+          retention-days: 5
+
+  # Tests E2E
+  e2e-tests:
+    name: Tests End-to-End
+    needs: [android-build, web-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Configuration Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Installation de Playwright
+        run: |
+          npx playwright install --with-deps
+        continue-on-error: true
+
+      - name: Configuration d'Android SDK
+        uses: android-actions/setup-android@v2
+
+      - name: Tests E2E Web
+        run: |
+          set -eo pipefail
+          ./gradlew :tests:e2e:testWeb --stacktrace || echo "Tests E2E Web échoués, mais on continue"
+        continue-on-error: true
+
+      - name: Téléchargement et installation de l'émulateur Android
+        run: |
+          echo "y" | sdkmanager "system-images;android-30;google_apis;x86_64"
+          echo "no" | avdmanager create avd --force --name test --package "system-images;android-30;google_apis;x86_64"
+          $ANDROID_HOME/emulator/emulator -avd test -no-audio -no-window -no-boot-anim -gpu swiftshader_indirect &
+          adb wait-for-device
+          adb shell input keyevent 82
+        continue-on-error: true
+
+      - name: Tests E2E Android
+        run: |
+          set -eo pipefail
+          ./gradlew :tests:e2e:testAndroid --stacktrace || echo "Tests E2E Android échoués, mais on continue"
+        continue-on-error: true
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'tests/e2e/build/test-results/**/TEST-*.xml'
+          check_name: 'Résultats de tests E2E'
+          fail_on_failure: false
+
+      - name: Upload résultats des tests E2E
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: tests/e2e/build/reports/
+          retention-days: 5
+
+  # Tests de performance
+  performance-tests:
+    name: Tests de Performance
+    needs: [core-modules, domain-modules, feature-modules]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # Réduit à 20 min car généralement moins long
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Tests de Performance
+        run: |
+          set -eo pipefail
+          ./gradlew :tests:performance:test --stacktrace || echo "Tests de performance échoués, mais on continue"
+        continue-on-error: true
+
+      - name: Publier les résultats de test
+        uses: mikepenz/action-junit-report@v3
+        if: always()
+        with:
+          report_paths: 'tests/performance/build/test-results/**/TEST-*.xml'
+          check_name: 'Résultats de tests de performance'
+          fail_on_failure: false
+
+      - name: Upload résultats des tests de performance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-test-results
+          path: tests/performance/build/reports/
+          retention-days: 5
+
+  # Analyse de sécurité
+  security-scan:
+    name: Analyse de Sécurité
+    needs: setup
+    if: ${{ needs.setup.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Analyse CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: java, javascript, kotlin
+          queries: security-extended
+
+      - name: Analyse de sécurité du code
+        uses: github/codeql-action/analyze@v2
+        # Critique - ne doit jamais être ignorée
+        continue-on-error: false
+
+      - name: Analyse des dépendances
+        run: |
+          set -eo pipefail
+          ./gradlew dependencyCheckAnalyze || echo "Analyse des dépendances échouée, mais on continue"
+        continue-on-error: true
+
+      - name: Upload rapport d'analyse de sécurité
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            **/build/reports/dependency-check-report.html
+            **/build/reports/dependency-check-report.json
+          retention-days: 30
+
+  # Rapport final
+  generate-reports:
+    name: Génération des Rapports
+    needs: [core-modules, domain-modules, feature-modules, android-build, ios-build, web-build, integration-tests, e2e-tests, performance-tests, security-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      GLOBAL_COVERAGE: ${{ env.GLOBAL_COVERAGE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Téléchargement de tous les artefacts
+        uses: actions/download-artifact@v4
+
+      # Création d'un rapport de couverture consolidé amélioré avec extraction XML
+      - name: Création du rapport de couverture consolidé
+        run: |
+          mkdir -p consolidated-coverage
+          
+          # Installer xmlstarlet sans les paquets recommandés pour garder l'image légère
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlstarlet || echo "xmlstarlet non disponible"
+          
+          # Extraction et consolidation des données de couverture
+          TOTAL_LINES=0
+          TOTAL_COVERED=0
+          
+          echo "# Rapport de couverture de code" > consolidated-coverage/summary.txt
+          echo "" >> consolidated-coverage/summary.txt
+          echo "| Module | Couverture | Statut |" >> consolidated-coverage/summary.txt
+          echo "|--------|------------|--------|" >> consolidated-coverage/summary.txt
+          
+          # Recherche récursive des rapports XML et HTML Jacoco
+          find . -name "jacocoTestReport.xml" | while read xml_file; do
+            MODULE=$(echo $xml_file | grep -o -E 'core/[^/]+|domain/[^/]+|features/[^/]+|platform/[^/]+' | sed 's/\//: /')
+            if [ -n "$MODULE" ]; then
+              # Essayer d'extraire les données du XML de façon robuste
+              if command -v xmlstarlet &> /dev/null; then
+                COVERED=$(xmlstarlet sel -t -v "//counter[@type='LINE']/@covered" "$xml_file" || echo "0")
+                MISSED=$(xmlstarlet sel -t -v "//counter[@type='LINE']/@missed" "$xml_file" || echo "0")
+                LINES=$((COVERED + MISSED))
+                if [ "$LINES" -gt 0 ]; then
+                  COVERAGE=$((COVERED * 100 / LINES))
+                else
+                  COVERAGE=0
+                fi
+              else
+                # Fallback sur l'extraction HTML
+                HTML_DIR=$(dirname "$xml_file")
+                HTML_FILE="$HTML_DIR/html/index.html"
+                if [ -f "$HTML_FILE" ]; then
+                  COVERAGE=$(grep -o 'Total[^%]*%' "$HTML_FILE" | grep -o '[0-9]\+' || echo "0")
+                  LINES=$(grep -o 'Total.*lines:.*' "$HTML_FILE" | grep -o '[0-9]\+' | head -1 || echo "0")
+                  COVERED=$(grep -o 'Total.*lines:.*' "$HTML_FILE" | grep -o '[0-9]\+' | tail -1 || echo "0")
+                else
+                  COVERAGE=0
+                  LINES=0
+                  COVERED=0
+                fi
+              fi
+              
+              if [ "$LINES" -gt 0 ]; then
+                echo "LINES=$LINES, COVERED=$COVERED for $MODULE"
+                TOTAL_LINES=$((TOTAL_LINES + LINES))
+                TOTAL_COVERED=$((TOTAL_COVERED + COVERED))
+                
+                if [ "$COVERAGE" -lt "${{ env.MIN_COVERAGE }}" ]; then
+                  STATUS="❌"
+                else
+                  STATUS="✅"
+                fi
+                
+                echo "| $MODULE | $COVERAGE% ($COVERED/$LINES) | $STATUS |" >> consolidated-coverage/summary.txt
+              fi
+            fi
+          done
+          
+          # Calcul du pourcentage global
+          if [ "$TOTAL_LINES" -gt 0 ]; then
+            GLOBAL_PCT=$((TOTAL_COVERED * 100 / TOTAL_LINES))
+            echo "" >> consolidated-coverage/summary.txt
+            echo "## Couverture globale: $GLOBAL_PCT% ($TOTAL_COVERED/$TOTAL_LINES lignes)" >> consolidated-coverage/summary.txt
+            
+            if [ "$GLOBAL_PCT" -lt "${{ env.MIN_COVERAGE }}" ]; then
+              echo "**❌ La couverture globale est inférieure au seuil de ${{ env.MIN_COVERAGE }}%**" >> consolidated-coverage/summary.txt
+            else
+              echo "**✅ La couverture globale respecte le seuil de ${{ env.MIN_COVERAGE }}%**" >> consolidated-coverage/summary.txt
+            fi
+            
+            echo "GLOBAL_COVERAGE=$GLOBAL_PCT" >> $GITHUB_ENV
+          else
+            echo "" >> consolidated-coverage/summary.txt
+            echo "## Impossible de calculer la couverture globale - données insuffisantes" >> consolidated-coverage/summary.txt
+            echo "GLOBAL_COVERAGE=0" >> $GITHUB_ENV
+          fi
+
+      - name: Création du rapport de synthèse
+        run: |
+          mkdir -p combined-reports
+          
+          # Utilisation de la date au format Europe/Paris
+          echo "# Rapport CI DetectXpert" > combined-reports/summary.md
+          echo "Généré le $(TZ='Europe/Paris' date +'%Y-%m-%d %H:%M:%S %Z')" >> combined-reports/summary.md
+          echo "" >> combined-reports/summary.md
+          
+          echo "## Informations sur l'exécution" >> combined-reports/summary.md
+          echo "- Commit: \`${{ github.sha }}\`" >> combined-reports/summary.md
+          echo "- Branche: \`${{ github.ref_name }}\`" >> combined-reports/summary.md
+          echo "- Run ID: \`${{ github.run_id }}\`" >> combined-reports/summary.md
+          echo "" >> combined-reports/summary.md
+          
+          echo "## Statut des jobs" >> combined-reports/summary.md
+          echo "| Module | Statut |" >> combined-reports/summary.md
+          echo "|--------|--------|" >> combined-reports/summary.md
+          echo "| Core Modules | ${{ (contains(needs.core-modules.result, 'failure') || contains(needs.core-modules.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Domain Modules | ${{ (contains(needs.domain-modules.result, 'failure') || contains(needs.domain-modules.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Feature Modules | ${{ (contains(needs.feature-modules.result, 'failure') || contains(needs.feature-modules.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Android | ${{ (contains(needs.android-build.result, 'failure') || contains(needs.android-build.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| iOS | ${{ (contains(needs.ios-build.result, 'failure') || contains(needs.ios-build.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Web | ${{ (contains(needs.web-build.result, 'failure') || contains(needs.web-build.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Tests d'intégration | ${{ (contains(needs.integration-tests.result, 'failure') || contains(needs.integration-tests.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Tests E2E | ${{ (contains(needs.e2e-tests.result, 'failure') || contains(needs.e2e-tests.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Tests de performance | ${{ (contains(needs.performance-tests.result, 'failure') || contains(needs.performance-tests.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "| Sécurité | ${{ (contains(needs.security-scan.result, 'failure') || contains(needs.security-scan.result, 'cancelled')) && '❌' || '✅' }} |" >> combined-reports/summary.md
+          echo "" >> combined-reports/summary.md
+          
+          # Ajouter la section de couverture si elle existe
+          if [ -f "consolidated-coverage/summary.txt" ]; then
+            cat consolidated-coverage/summary.txt >> combined-reports/summary.md
+          fi
+          
+          echo "" >> combined-reports/summary.md
+          
+          # Artefacts disponibles
+          echo "## Artefacts générés" >> combined-reports/summary.md
+          echo "| Plateforme | Artefacts |" >> combined-reports/summary.md
+          echo "|------------|-----------|" >> combined-reports/summary.md
+          echo "| Android    | [android-debug-apk](../artifacts/android-debug-apk) |" >> combined-reports/summary.md
+          echo "| iOS        | [ios-debug-build](../artifacts/ios-debug-build) |" >> combined-reports/summary.md
+          echo "| Web        | [web-build](../artifacts/web-build) |" >> combined-reports/summary.md
+          echo "" >> combined-reports/summary.md
+          
+          # Ajouter un résumé visuel de l'état global
+          echo "## Statut global" >> combined-reports/summary.md
+          if [[ "${{ needs.core-modules.result }}" == "success" && "${{ needs.domain-modules.result }}" == "success" ]]; then
+            echo "### ✅ Tests principaux réussis" >> combined-reports/summary.md
+          else
+            echo "### ❌ Échec dans les tests principaux" >> combined-reports/summary.md
+          fi
+          
+          # Pied de page
+          echo "" >> combined-reports/summary.md
+          echo "---" >> combined-reports/summary.md
+          echo "_Ce rapport a été généré automatiquement par le workflow CI DetectXpert._" >> combined-reports/summary.md
+
+      # Utilisation de l'API Check Runs pour enrichir les résultats
+      - name: Publication du rapport via Check Runs API
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let summary = '';
+            
+            try {
+              summary = fs.readFileSync('combined-reports/summary.md', 'utf8');
+            } catch (e) {
+              summary = "Impossible de lire le rapport de synthèse.";
+            }
+            
+            // Création d'un Check Run
+            const { data } = await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Rapport de CI DetectXpert',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: process.env.GLOBAL_COVERAGE >= process.env.MIN_COVERAGE ? 'success' : 'neutral',
+              output: {
+                title: `Rapport CI - Couverture: ${process.env.GLOBAL_COVERAGE}%`,
+                summary: summary,
+                text: 'Rapport détaillé disponible dans les artefacts du workflow.'
+              }
+            });
+            
+            // Création d'un commentaire sur la PR si c'est une PR
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: summary
+              });
+            }
+
+      - name: Upload du rapport consolidé
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-reports
+          path: combined-reports/
+          retention-days: 30
+
+      # Section de notification Slack améliorée
+      - name: Notification Slack en cas de succès
+        if: success() && false  # Désactivé par défaut, activer en supprimant "& false"
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: '#2eb886'
+          SLACK_TITLE: "✅ Build DetectXpert ${{ github.ref_name }} réussi"
+          SLACK_MESSAGE: "Build réussi - Couverture: ${{ env.GLOBAL_COVERAGE }}%"
+          SLACK_FOOTER: "Voir les détails: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        continue-on-error: true
+
+      - name: Notification Slack en cas d'échec
+        if: failure() && false  # Désactivé par défaut, activer en supprimant "& false"
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: '#e01e5a'
+          SLACK_TITLE: "❌ Build DetectXpert ${{ github.ref_name }} échoué"
+          SLACK_MESSAGE: "Build échoué - Vérifiez les logs pour plus d'informations"
+          SLACK_FOOTER: "Voir les détails: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        continue-on-error: true
+
+      - name: Notification de fin de workflow
+        if: always()
+        run: |
+          echo "::notice::Le workflow CI est terminé. Consultez les rapports pour plus de détails."

@@ -1,0 +1,220 @@
+# Version: 1.1.0
+name: 'Validate Inputs'
+description: 'Valide les entrées requises pour les workflows DetectXpert et garantit leur conformité aux formats attendus'
+author: 'DetectXpert DevOps Team'
+repository: 'https://github.com/detectxpert/devops'
+homepage: 'https://github.com/detectxpert/devops/tree/main/.github/actions/validate_inputs'
+
+# Définition des ancres YAML pour la réutilisation
+x-bool-input: &bool-input
+  type: boolean
+  required: false
+
+x-string-input: &string-input
+  type: string
+  required: false
+
+x-required-string-input: &required-string-input
+  type: string
+  required: true
+
+# Prérequis
+# - Cette action nécessite jq, installé par défaut sur les runners GitHub Actions
+# - En cas d'échec, l'action renvoie une sortie claire avec is_valid=false et des messages d'erreur détaillés
+# - Pour des exemples d'utilisation détaillés, consultez le README.md
+# - Note: Les valeurs autorisées (allowed-values) sont documentaires, la validation est effectuée par le script
+
+inputs:
+  # Configuration du mode de debug
+  debug:
+    <<: *bool-input
+    description: 'Active le mode debug pour des logs détaillés'
+    default: false
+  
+  # Paramètres de base du déploiement
+  environment:
+    <<: *required-string-input
+    description: 'Environnement de déploiement'
+    default: 'development'
+    allowed-values:
+      - development
+      - staging
+      - production
+  
+  version:
+    <<: *required-string-input
+    description: 'Version à déployer (format semver: x.y.z). Validé par regex conforme à la spécification SemVer.'
+    # Pas de default car c'est un champ obligatoire
+  
+  branch:
+    <<: *string-input
+    description: 'Branche source pour le déploiement. Caractères acceptés: alphanumériques, points, tirets et slashs.'
+    default: 'main'
+  
+  # Paramètres de build
+  build_type:
+    <<: *string-input
+    description: 'Type de build'
+    default: 'debug'
+    allowed-values:
+      - debug
+      - release
+  
+  product_flavor:
+    <<: *string-input
+    description: 'Variante du produit'
+    default: 'freemium'
+    allowed-values:
+      - freemium
+      - premium
+      - professional
+  
+  # Paramètres de déploiement
+  deployment_target:
+    <<: *string-input
+    description: 'Cible de déploiement'
+    default: 'android'
+    allowed-values:
+      - android
+      - ios
+      - web
+      - desktop
+      - all
+  
+  artifact_path:
+    <<: *string-input
+    description: 'Chemin relatif où les artéfacts générés seront stockés. Ne doit pas contenir de caractères spéciaux comme $ ou commencer par /.'
+    default: 'build/outputs'
+  
+  # Configuration des fonctionnalités
+  enabled_features:
+    <<: *string-input
+    description: 'Liste séparée par des virgules des fonctionnalités à activer (valeurs acceptées: tomography, ar, multimodal, quantum, ai, ou "all" pour activer toutes)'
+    default: 'ai'
+  
+  rtk_support:
+    <<: *bool-input
+    description: 'Activer le support RTK pour la localisation précise'
+    default: false
+  
+  offline_mode_level:
+    <<: *string-input
+    description: 'Niveau de support du mode hors ligne'
+    default: 'basic'
+    allowed-values:
+      - basic
+      - advanced
+      - full
+  
+  # Paramètres de test
+  skip_tests:
+    <<: *bool-input
+    description: 'Si true, saute les tests unitaires et d''intégration'
+    default: false
+  
+  test_devices:
+    <<: *string-input
+    description: 'Liste d''appareils pour les tests, séparés par des virgules. Utilisez "default" pour les appareils standard.'
+    default: 'default'
+  
+  code_coverage_threshold:
+    type: number
+    required: false
+    description: 'Seuil minimal pour la couverture de code (entier entre 0 et 100)'
+    default: 70
+  
+  # Paramètres d'intégrations externes
+  api_key:
+    <<: *string-input
+    description: 'Clé API pour accéder aux services externes. À utiliser avec des secrets: ${{ secrets.API_KEY }}'
+    # Pas de valeur par défaut pour des raisons de sécurité
+  
+  map_provider:
+    <<: *string-input
+    description: 'Fournisseur de cartes'
+    default: 'osm'
+    allowed-values:
+      - google
+      - mapbox
+      - osm
+  
+  analytics_enabled:
+    <<: *bool-input
+    description: 'Activer l''analyse et le suivi des données'
+    default: false
+  
+  # Paramètres de performance
+  performance_profile:
+    <<: *string-input
+    description: 'Profil de performance'
+    default: 'balanced'
+    allowed-values:
+      - balanced
+      - performance
+      - battery
+  
+  # Paramètres de sécurité
+  security_level:
+    <<: *string-input
+    description: 'Niveau de sécurité'
+    default: 'standard'
+    allowed-values:
+      - standard
+      - high
+      - extreme
+  
+  encryption_enabled:
+    <<: *bool-input
+    description: 'Activer le chiffrement des données'
+    default: false
+
+outputs:
+  is_valid:
+    description: 'Booléen indiquant si toutes les entrées sont valides (true/false)'
+    value: ${{ steps.validate_all.outputs.is_valid }}
+  
+  validation_errors:
+    description: 'Liste des erreurs de validation rencontrées au format JSON. Tableau vide [] si aucune erreur.'
+    value: ${{ steps.validate_all.outputs.validation_errors }}
+  
+  normalized_version:
+    description: 'Version normalisée au format semver, confirmée comme valide'
+    value: ${{ steps.validate_all.outputs.normalized_version }}
+  
+  deployment_id:
+    description: 'Identifiant unique généré pour ce déploiement (format: environment-timestamp-runid)'
+    value: ${{ steps.validate_all.outputs.deployment_id }}
+  
+  build_matrix:
+    description: 'Matrice de builds à exécuter basée sur les paramètres de déploiement (format JSON)'
+    value: ${{ steps.validate_all.outputs.build_matrix }}
+  
+  feature_flags:
+    description: 'Configuration des feature flags pour ce déploiement (format JSON objet avec clés=fonctionnalités, valeurs=booléens)'
+    value: ${{ steps.validate_all.outputs.feature_flags }}
+  
+  estimated_build_time:
+    description: 'Temps estimé pour le processus de build complet (en minutes)'
+    value: ${{ steps.validate_all.outputs.estimated_build_time }}
+  
+  skip_matrix:
+    description: 'Indique si la génération de matrice doit être ignorée (true en cas d''erreurs de validation)'
+    value: ${{ steps.validate_all.outputs.skip_matrix }}
+  
+  validation_summary:
+    description: 'Résumé des validations effectuées avec environnement, version, cibles et autres paramètres clés (format JSON)'
+    value: ${{ steps.validate_all.outputs.validation_summary }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Exécuter le script de validation
+      id: validate_all
+      shell: bash
+      env:
+        VALIDATE_INPUTS_DEBUG: ${{ inputs.debug == 'true' && '1' || '0' }}
+      run: ${{ github.action_path }}/validate_inputs.sh
+
+branding:
+  icon: 'check-circle'
+  color: 'green'

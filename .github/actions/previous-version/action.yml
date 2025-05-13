@@ -1,0 +1,379 @@
+# ====================================================================
+# Previous Version Extractor - Action GitHub pour DetectXpert
+# ====================================================================
+# 
+# IMPORTANT: Cette action intègre maintenant le checkout du code,
+# mais si vous avez besoin de personnaliser ce checkout ou si vous
+# l'avez déjà fait dans votre workflow, utilisez l'input skip-checkout.
+#
+# UTILISATION RECOMMANDÉE :
+# 
+# jobs:
+#   release:
+#     runs-on: ubuntu-latest
+#     steps:
+#       # L'action fait maintenant son propre checkout, vous n'avez pas besoin
+#       # d'ajouter cette étape sauf si vous avez des besoins spécifiques
+#       
+#       - name: Obtenir la version précédente
+#         id: prev-version
+#         uses: ./.github/actions/previous-version
+#         with:
+#           repo-token: ${{ secrets.GITHUB_TOKEN }}
+#           # Désactiver le checkout intégré si vous l'avez déjà fait
+#           # skip-checkout: true
+#           # Générer un fichier JSON avec les résultats
+#           json-output: true
+#           # Autres paramètres selon vos besoins...
+#
+#       # Utilisation des sorties
+#       - name: Afficher infos version
+#         run: |
+#           echo "Version précédente: ${{ steps.prev-version.outputs.previous-version }}"
+#           echo "Majeur: ${{ steps.prev-version.outputs.major }}"
+#           echo "Mineur: ${{ steps.prev-version.outputs.minor }}"
+#           echo "Patch: ${{ steps.prev-version.outputs.patch }}"
+#           
+#           # Utilisation du fichier JSON si généré
+#           if [ -f "previous-version.json" ]; then
+#             echo "Contenu JSON complet:"
+#             cat previous-version.json | jq .
+#           fi
+#
+# Pour plus d'exemples d'intégration, voir le fichier README.md.
+#
+# REMARQUE IMPORTANTE:
+# Cette action est actuellement en version Composite. Pour une version JavaScript
+# offrant plus de flexibilité et disponible sur GitHub Marketplace, voir:
+# github.com/detectxpert/previous-version-action
+# ====================================================================
+
+name: 'Previous Version Extractor'
+description: 'Extrait et analyse la version précédente de DetectXpert pour faciliter les processus de versionnement automatique, migration et génération de notes de version'
+author: 'DetectXpert Team'
+
+branding:
+  icon: 'tag'
+  color: 'blue'
+
+# Permissions minimales requises par l'action
+permissions:
+  contents: read  # Pour checkout et accès aux tags/releases
+  actions: read   # Si vous interrogez l'API GitHub pour les releases
+
+inputs:
+  repo-token:
+    description: 'Token GitHub pour accéder aux versions et tags du dépôt'
+    required: true
+  skip-checkout:
+    description: 'Ignorer l''étape de checkout intégrée (si vous avez déjà fait votre propre checkout)'
+    required: false
+    default: 'false'
+  version-pattern:
+    description: 'Expression régulière pour filtrer les versions (ex: v[0-9]+\.[0-9]+\.[0-9]+)'
+    required: false
+    default: 'v[0-9]+\.[0-9]+\.[0-9]+.*'
+  exclude-pre-releases:
+    description: 'Exclure les versions pre-release (true/false)'
+    required: false
+    default: 'true'
+  exclude-drafts:
+    description: 'Exclure les releases en mode brouillon (true/false)'
+    required: false
+    default: 'true'
+  version-source:
+    description: 'Source des versions: tags, releases ou package'
+    required: false
+    default: 'releases'
+  limit:
+    description: 'Nombre maximum de versions à analyser pour trouver la précédente'
+    required: false
+    default: '10'
+  current-version:
+    description: 'Version actuelle si déjà déterminée (pour trouver la version juste avant)'
+    required: false
+  fallback-version:
+    description: 'Version par défaut si aucune version précédente n'est trouvée'
+    required: false
+    default: 'v0.0.0'
+  flavor:
+    description: 'Variante de produit pour gérer plusieurs lignes de versions (premium, standard, etc.)'
+    required: false
+  compare-to-branch:
+    description: 'Branche à utiliser pour la comparaison (main, develop, etc.)'
+    required: false
+    default: 'main'
+  skip-jq-check:
+    description: 'Ignorer la vérification de jq (si vous utilisez déjà azukiapp/jq-action@v1)'
+    required: false
+    default: 'false'
+  json-output:
+    description: 'Générer un fichier JSON avec tous les résultats (true/false)'
+    required: false
+    default: 'false'
+  json-path:
+    description: 'Chemin où écrire le fichier JSON de sortie'
+    required: false
+    default: 'previous-version.json'
+  debug:
+    description: 'Active le mode debug pour afficher plus d'informations (true/false)'
+    required: false
+    default: 'false'
+
+outputs:
+  previous-version:
+    description: 'La version précédente au format semver (x.y.z)'
+  previous-version-tag:
+    description: 'Le tag complet de la version précédente (incluant préfixe et suffixes éventuels)'
+  major:
+    description: 'La composante majeure de la version précédente'
+  minor:
+    description: 'La composante mineure de la version précédente'
+  patch:
+    description: 'La composante patch de la version précédente'
+  pre-release:
+    description: 'Identifiant pre-release éventuel (alpha, beta, etc.)'
+  build-metadata:
+    description: 'Métadonnées de build éventuelles'
+  release-date:
+    description: 'Date de publication de la version précédente'
+  has-previous:
+    description: 'Indique si une version précédente a été trouvée (true/false)'
+  commits-since:
+    description: 'Nombre de commits depuis la version précédente'
+  major-changed:
+    description: 'Indique si la partie majeure a changé depuis la version précédente (true/false)'
+  changelog-url:
+    description: 'URL des notes de version de la release précédente'
+  release-id:
+    description: 'ID interne de la release précédente'
+  json-path:
+    description: 'Chemin vers le fichier JSON généré si json-output est true'
+
+runs:
+  using: 'composite'
+  steps:
+    # Intégration directe de l'étape de checkout
+    - name: Checkout du code avec historique complet
+      if: inputs.skip-checkout != 'true'
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0 # Récupère tout l'historique et tous les tags
+
+    - name: Afficher les paramètres d'entrée (debug)
+      if: inputs.debug == 'true'
+      shell: bash
+      run: |
+        echo "::group::Paramètres d'entrée"
+        echo "skip-checkout = ${{ inputs.skip-checkout }}"
+        echo "version-pattern = ${{ inputs.version-pattern }}"
+        echo "exclude-pre-releases = ${{ inputs.exclude-pre-releases }}"
+        echo "exclude-drafts = ${{ inputs.exclude-drafts }}"
+        echo "version-source = ${{ inputs.version-source }}"
+        echo "limit = ${{ inputs.limit }}"
+        echo "current-version = ${{ inputs.current-version }}"
+        echo "fallback-version = ${{ inputs.fallback-version }}"
+        echo "flavor = ${{ inputs.flavor }}"
+        echo "compare-to-branch = ${{ inputs.compare-to-branch }}"
+        echo "skip-jq-check = ${{ inputs.skip-jq-check }}"
+        echo "json-output = ${{ inputs.json-output }}"
+        echo "json-path = ${{ inputs.json-path }}"
+        echo "debug = ${{ inputs.debug }}"
+        echo "::endgroup::"
+
+    # Installation de jq avec cache
+    - name: Configuration du cache jq
+      if: inputs.skip-jq-check != 'true'
+      id: jq-cache
+      uses: actions/cache@v3
+      with:
+        path: |
+          /usr/bin/jq
+          /usr/local/bin/jq
+        key: ${{ runner.os }}-jq-1.6
+    
+    # Installation de jq seulement si nécessaire et non mis en cache
+    - name: Installer jq
+      if: inputs.skip-jq-check != 'true' && steps.jq-cache.outputs.cache-hit != 'true'
+      uses: azukiapp/jq-action@v1
+      
+    - name: Vérifier les prérequis et valider les entrées
+      id: check-prereqs
+      shell: bash
+      run: |
+        # Collecte de tous les problèmes
+        VALIDATION_ERRORS=()
+        VALIDATION_WARNINGS=()
+        
+        # Vérifier que le dépôt est bien checkout avec l'historique complet
+        if [ "$(git rev-parse --is-shallow-repository)" == "true" ]; then
+          VALIDATION_WARNINGS+=("Le dépôt est shallow clone. L'action de checkout intégrée utilise fetch-depth: 0, mais si vous avez désactivé ce checkout, assurez-vous d'effectuer un checkout complet.")
+        fi
+        
+        # Validation du pattern
+        if ! echo "test" | grep -E "${{ inputs.version-pattern }}" &>/dev/null && [[ "${{ inputs.version-pattern }}" != "" ]]; then
+          VALIDATION_ERRORS+=("L'expression régulière de version-pattern '${{ inputs.version-pattern }}' n'est pas valide")
+        fi
+        
+        # Validation de limit
+        if ! [[ "${{ inputs.limit }}" =~ ^[0-9]+$ ]]; then
+          VALIDATION_ERRORS+=("Le paramètre 'limit' doit être un entier positif, reçu: '${{ inputs.limit }}'")
+        fi
+        
+        # Validation des valeurs booléennes
+        for varname in "skip-checkout" "exclude-pre-releases" "exclude-drafts" "skip-jq-check" "json-output" "debug"; do
+          varvalue=$(eval echo "\${{ inputs.$varname }}")
+          if [[ "$varvalue" != "true" && "$varvalue" != "false" ]]; then
+            VALIDATION_ERRORS+=("Le paramètre '$varname' doit être 'true' ou 'false', reçu: '$varvalue'")
+          fi
+        done
+        
+        # Validation de version-source
+        if [[ "${{ inputs.version-source }}" != "tags" && "${{ inputs.version-source }}" != "releases" && "${{ inputs.version-source }}" != "package" ]]; then
+          VALIDATION_ERRORS+=("Le paramètre 'version-source' doit être 'tags', 'releases' ou 'package', reçu: '${{ inputs.version-source }}'")
+        fi
+        
+        # Vérifier si jq est nécessaire pour JSON output
+        if [[ "${{ inputs.json-output }}" == "true" && "${{ inputs.skip-jq-check }}" == "true" ]]; then
+          VALIDATION_WARNINGS+=("L'option json-output est activée mais skip-jq-check aussi. Assurez-vous que jq est disponible pour générer un JSON valide.")
+        fi
+        
+        # Afficher tous les avertissements
+        if [ ${#VALIDATION_WARNINGS[@]} -gt 0 ]; then
+          echo "::group::Avertissements de validation"
+          for warning in "${VALIDATION_WARNINGS[@]}"; do
+            echo "::warning::$warning"
+          done
+          echo "::endgroup::"
+        fi
+        
+        # Afficher et sortir si erreurs
+        if [ ${#VALIDATION_ERRORS[@]} -gt 0 ]; then
+          echo "::group::Erreurs de validation"
+          for error in "${VALIDATION_ERRORS[@]}"; do
+            echo "::error::$error"
+          done
+          echo "::endgroup::"
+          echo "::error::${#VALIDATION_ERRORS[@]} erreur(s) détectée(s) dans les paramètres. Veuillez les corriger avant de continuer."
+          exit 1
+        fi
+      
+    - name: Configurer Node.js pour semver
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'
+        check-latest: true
+        cache: 'npm'
+        cache-dependency-path: '**/package-lock.json'
+      
+    - name: Extraire la version précédente
+      id: extract-version
+      shell: bash
+      run: |
+        # Activer le debug si demandé
+        [[ "${{ inputs.debug }}" == "true" ]] && set -x
+        
+        echo "::group::Récupération de la version précédente"
+        
+        # Exécuter le script et capturer code retour
+        "${{ github.action_path }}/previous-version.sh"
+        SCRIPT_EXIT_CODE=$?
+        
+        echo "::endgroup::"
+        
+        # Vérifier le code de retour
+        if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
+          echo "::error::Erreur lors de l'extraction de la version précédente (code $SCRIPT_EXIT_CODE)"
+          exit $SCRIPT_EXIT_CODE
+        fi
+        
+        # Mapper les sorties du script pour qu'elles soient accessibles aux étapes suivantes
+        # Note: Ces sorties sont supposées être déjà définies par le script previous-version.sh
+        # qui utilise la syntaxe echo "{name}={value}" >> $GITHUB_OUTPUT
+        
+        # Si le script n'utilise pas ce format, ajoutez les lignes comme ci-dessous:
+        # echo "previous-version=${{ steps.extract-version.outputs.previous-version || inputs.fallback-version }}" >> $GITHUB_OUTPUT
+        # echo "major=${{ steps.extract-version.outputs.major || '0' }}" >> $GITHUB_OUTPUT
+        # ...etc
+      env:
+        GITHUB_TOKEN: ${{ inputs.repo-token }}
+        VERSION_PATTERN: ${{ inputs.version-pattern }}
+        EXCLUDE_PRE_RELEASES: ${{ inputs.exclude-pre-releases }}
+        EXCLUDE_DRAFTS: ${{ inputs.exclude-drafts }}
+        VERSION_SOURCE: ${{ inputs.version-source }}
+        VERSION_LIMIT: ${{ inputs.limit }}
+        CURRENT_VERSION: ${{ inputs.current-version }}
+        FALLBACK_VERSION: ${{ inputs.fallback-version }}
+        PRODUCT_FLAVOR: ${{ inputs.flavor }}
+        COMPARE_BRANCH: ${{ inputs.compare-to-branch }}
+        SCRIPT_DEBUG: ${{ inputs.debug }}
+        
+    - name: Générer sortie JSON
+      if: inputs.json-output == 'true'
+      id: generate-json
+      shell: bash
+      run: |
+        # Création du fichier JSON avec expansion correcte des variables
+        cat <<EOF > "${{ inputs.json-path }}"
+        {
+          "previous_version": "${{ steps.extract-version.outputs.previous-version || inputs.fallback-version }}",
+          "previous_version_tag": "${{ steps.extract-version.outputs.previous-version-tag || inputs.fallback-version }}",
+          "major": ${{ steps.extract-version.outputs.major || 0 }},
+          "minor": ${{ steps.extract-version.outputs.minor || 0 }},
+          "patch": ${{ steps.extract-version.outputs.patch || 0 }},
+          "pre_release": "${{ steps.extract-version.outputs.pre-release || '' }}",
+          "build_metadata": "${{ steps.extract-version.outputs.build-metadata || '' }}",
+          "release_date": "${{ steps.extract-version.outputs.release-date || '' }}",
+          "has_previous": ${{ steps.extract-version.outputs.has-previous || false }},
+          "commits_since": ${{ steps.extract-version.outputs.commits-since || 0 }},
+          "major_changed": ${{ steps.extract-version.outputs.major-changed || false }},
+          "changelog_url": "${{ steps.extract-version.outputs.changelog-url || '' }}",
+          "release_id": "${{ steps.extract-version.outputs.release-id || '' }}"
+        }
+        EOF
+        
+        # Validation du JSON généré
+        if command -v jq &> /dev/null; then
+          if ! jq '.' "${{ inputs.json-path }}" > /dev/null; then
+            echo "::error::Le JSON généré n'est pas valide. Vérifiez le contenu du fichier."
+            exit 1
+          fi
+          
+          if [ "${{ inputs.debug }}" == "true" ]; then
+            echo "::group::Contenu JSON généré"
+            jq '.' "${{ inputs.json-path }}"
+            echo "::endgroup::"
+          fi
+        else
+          echo "::warning::jq n'est pas disponible, impossible de valider le JSON généré."
+        fi
+        
+        # Ajouter le chemin du fichier JSON aux outputs
+        echo "json-path=${{ inputs.json-path }}" >> $GITHUB_OUTPUT
+        
+    - name: Vérifier l'extraction et afficher résultats
+      shell: bash
+      run: |
+        # Affichage du résultat
+        echo "::group::Résultats de l'extraction"
+        echo "Version précédente détectée: ${{ steps.extract-version.outputs.previous-version || inputs.fallback-version }}"
+        
+        if [ "${{ steps.extract-version.outputs.has-previous }}" != "true" ]; then
+          echo "::warning::Aucune version précédente trouvée, utilisation de la version par défaut: ${{ inputs.fallback-version }}"
+        else
+          echo "Composantes:"
+          echo "- Majeur: ${{ steps.extract-version.outputs.major }}"
+          echo "- Mineur: ${{ steps.extract-version.outputs.minor }}"
+          echo "- Patch: ${{ steps.extract-version.outputs.patch }}"
+          [ ! -z "${{ steps.extract-version.outputs.pre-release }}" ] && echo "- Pre-release: ${{ steps.extract-version.outputs.pre-release }}"
+          [ ! -z "${{ steps.extract-version.outputs.build-metadata }}" ] && echo "- Build metadata: ${{ steps.extract-version.outputs.build-metadata }}"
+          [ ! -z "${{ steps.extract-version.outputs.release-date }}" ] && echo "- Date: ${{ steps.extract-version.outputs.release-date }}"
+          [ ! -z "${{ steps.extract-version.outputs.commits-since }}" ] && echo "- Commits depuis: ${{ steps.extract-version.outputs.commits-since }}"
+          [ ! -z "${{ steps.extract-version.outputs.changelog-url }}" ] && echo "- Changelog: ${{ steps.extract-version.outputs.changelog-url }}"
+        fi
+        
+        if [ "${{ inputs.json-output }}" == "true" ]; then
+          echo "Fichier JSON généré: ${{ steps.generate-json.outputs.json-path }}"
+        fi
+        
+        echo "::endgroup::"

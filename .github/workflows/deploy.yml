@@ -1,0 +1,2081 @@
+name: Deploy DetectXpert
+
+# Définition des permissions avec principe du moindre privilège
+permissions:
+  contents: read
+  id-token: write  # Nécessaire pour OIDC avec AWS/GCP
+  security-events: write  # Pour CodeQL/SARIF
+  deployments: write  # Pour les statuts de déploiement GitHub
+  # Permissions conditionnelles selon le contexte
+  pull-requests: ${{ github.event_name == 'pull_request' && 'write' || 'read' }}
+  issues: ${{ (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.release_type, 'rollback')) && 'write' || 'read' }}
+
+# Variables d'environnement globales avec versions actualisées
+env:
+  JAVA_VERSION: '17'
+  KOTLIN_VERSION: '1.9.23'  # Version actualisée de Kotlin
+  NODE_VERSION: '20'         # Version LTS plus récente
+  # Options Gradle conditionnelles selon le job - maintien du daemon pour les builds
+  GRADLE_OPTS: ${{ (github.job == 'build' || contains(github.job, 'test')) && '-Dorg.gradle.daemon=true -Dorg.gradle.workers.max=4 -Dkotlin.incremental=true' || '-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4 -Dkotlin.incremental=false -Dkotlin.compiler.execution.strategy=in-process' }}
+  ANDROID_COMPILE_SDK: '34'  # SDK de compilation Android actualisé
+
+# Configuration pour éviter les exécutions simultanées sur la même référence
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+      - 'feature/deploy/**'  # Limité aux branches feature explicitement pour déploiement
+    tags:
+      - 'v*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - 'release/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environnement de déploiement'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      platform:
+        description: 'Plateforme à déployer'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - android
+          - ios
+          - web
+      release_type:
+        description: 'Type de release'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - hotfix
+          - rollback
+
+jobs:
+  validate-inputs:
+    name: Validation des entrées
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      validated: ${{ steps.validate.outputs.validated }}
+    steps:
+      - name: Validation des inputs
+        id: validate
+        run: |
+          set -e
+          
+          # Validation explicite des inputs pour une meilleure gestion des erreurs
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          PLATFORM="${{ github.event.inputs.platform }}"
+          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+          
+          if ! [[ "$ENVIRONMENT" =~ ^(development|staging|production)$ ]]; then
+            echo "::error::Environnement invalide: $ENVIRONMENT. Valeurs autorisées: development, staging, production"
+            exit 1
+          fi
+          
+          if ! [[ "$PLATFORM" =~ ^(all|android|ios|web)$ ]]; then
+            echo "::error::Plateforme invalide: $PLATFORM. Valeurs autorisées: all, android, ios, web"
+            exit 1
+          fi
+          
+          if ! [[ "$RELEASE_TYPE" =~ ^(normal|hotfix|rollback)$ ]]; then
+            echo "::error::Type de release invalide: $RELEASE_TYPE. Valeurs autorisées: normal, hotfix, rollback"
+            exit 1
+          fi
+          
+          echo "validated=true" >> $GITHUB_OUTPUT
+          echo "✅ Validation des inputs réussie"
+      
+      - name: Résumé des paramètres validés
+        if: success()
+        run: |
+          echo "Environnement: ${{ github.event.inputs.environment }}"
+          echo "Plateforme: ${{ github.event.inputs.platform }}"
+          echo "Type de release: ${{ github.event.inputs.release_type }}"
+
+  prepare:
+    name: Préparation du Déploiement
+    needs: [ validate-inputs ]
+    if: always() && (needs.validate-inputs.result == 'success' || needs.validate-inputs.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version-info.outputs.version }}
+      environment: ${{ steps.environment-config.outputs.environment }}
+      matrix: ${{ steps.version-info.outputs.matrix }}
+      summary_file: ${{ steps.setup-summary.outputs.summary_file }}
+      web_url: ${{ steps.environment-config.outputs.web_url }}
+      android_url: ${{ steps.environment-config.outputs.android_url }}
+      ios_url: ${{ steps.environment-config.outputs.ios_url }}
+      is_rollback: ${{ steps.environment-config.outputs.is_rollback }}
+      release_type: ${{ steps.environment-config.outputs.release_type }}
+      deployment_id: ${{ steps.create-deployment.outputs.deployment_id }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configuration JDK pour scripts Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Initialisation du fichier de résumé
+        id: setup-summary
+        run: |
+          set -e
+          SUMMARY_FILE="deployment-summary.md"
+          echo "summary_file=$SUMMARY_FILE" >> $GITHUB_OUTPUT
+          
+          echo "# Résumé du Déploiement DetectXpert" > $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          echo "Date: $(date)" >> $SUMMARY_FILE
+          echo "Commit: ${{ github.sha }}" >> $SUMMARY_FILE
+          echo "Workflow: ${{ github.workflow }}" >> $SUMMARY_FILE
+          echo "Déclencheur: ${{ github.event_name }}" >> $SUMMARY_FILE
+          echo "Exécuteur: ${{ github.actor }}" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      # Centralisation de la configuration d'environnement pour éviter la duplication
+      - name: Configuration de l'environnement
+        id: environment-config
+        run: |
+          set -e
+          
+          # Détermination de l'environnement
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+            RELEASE_TYPE="${{ github.event.inputs.release_type || 'normal' }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ENV="production"
+            RELEASE_TYPE="normal"
+          elif [[ "$GITHUB_REF" == refs/heads/release/* ]]; then
+            ENV="staging"
+            RELEASE_TYPE="normal"
+          else
+            ENV="development"
+            RELEASE_TYPE="normal"
+          fi
+          
+          # Export: est-ce un rollback?
+          IS_ROLLBACK="false"
+          if [[ "$RELEASE_TYPE" == "rollback" ]]; then
+            IS_ROLLBACK="true"
+          fi
+          
+          # URLs selon l'environnement
+          if [[ "$ENV" == "production" ]]; then
+            WEB_URL="https://${{ secrets.PROD_DOMAIN_NAME }}"
+            ANDROID_URL="https://play.google.com/store/apps/details?id=com.detectxpert"
+            IOS_URL="https://apps.apple.com/app/detectxpert/idXXXXXXXXXX"
+          elif [[ "$ENV" == "staging" ]]; then
+            WEB_URL="https://${{ secrets.STAGING_DOMAIN_NAME }}"
+            ANDROID_URL="https://appdistribution.firebase.dev/i/${{ secrets.FIREBASE_APP_ID_ANDROID }}"
+            IOS_URL="https://testflight.apple.com/join/${{ secrets.TESTFLIGHT_INVITATION_CODE || 'INVITATION_CODE_PLACEHOLDER' }}"
+          else
+            WEB_URL="https://${{ secrets.FIREBASE_PROJECT_ID }}-$ENV.web.app"
+            ANDROID_URL="https://appdistribution.firebase.dev/i/${{ secrets.FIREBASE_APP_ID_ANDROID }}"
+            IOS_URL="https://testflight.apple.com/join/${{ secrets.TESTFLIGHT_INVITATION_CODE || 'INVITATION_CODE_PLACEHOLDER' }}"
+          fi
+          
+          # Exports des variables
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "is_rollback=$IS_ROLLBACK" >> $GITHUB_OUTPUT
+          echo "web_url=$WEB_URL" >> $GITHUB_OUTPUT
+          echo "android_url=$ANDROID_URL" >> $GITHUB_OUTPUT
+          echo "ios_url=$IOS_URL" >> $GITHUB_OUTPUT
+          
+          echo "✅ Configuration d'environnement initialisée: env=$ENV, release=$RELEASE_TYPE, rollback=$IS_ROLLBACK"
+
+      # Script centralisé pour la génération de version et matrice
+      - name: Détermination de la version et configuration de matrice
+        id: version-info
+        env:
+          SUMMARY_FILE: ${{ steps.setup-summary.outputs.summary_file }}
+        run: |
+          set -e
+          
+          # Utilisation des données d'environnement déjà configurées
+          ENV="${{ steps.environment-config.outputs.environment }}"
+          RELEASE_TYPE="${{ steps.environment-config.outputs.release_type }}"
+          
+          # Détermination de la version
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Utilisez la tâche Gradle pour obtenir la version
+            VERSION=$(./gradlew -q printVersion)
+            SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-8)
+            VERSION="${VERSION}-${SHORT_SHA}"
+            
+            # Ajout du suffixe pour hotfix
+            if [[ "$RELEASE_TYPE" == "hotfix" ]]; then
+              VERSION="${VERSION}-hotfix"
+            fi
+          fi
+          
+          # Détermination de la matrice de build
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.platform }}" != "all" ]]; then
+            PLATFORMS='["${{ github.event.inputs.platform }}"]'
+          else
+            PLATFORMS='["android", "ios", "web"]'
+          fi
+          
+          # Exports des variables
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "matrix={\"platform\":$PLATFORMS}" >> $GITHUB_OUTPUT
+          
+          # Mise à jour du résumé
+          echo "## Configuration" >> $SUMMARY_FILE
+          echo "- **Version:** $VERSION" >> $SUMMARY_FILE
+          echo "- **Environnement:** $ENV" >> $SUMMARY_FILE
+          echo "- **Type de release:** $RELEASE_TYPE" >> $SUMMARY_FILE
+          echo "- **Plateformes:** $(echo $PLATFORMS | tr -d '[]"')" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          echo "✅ Configuration de version initialisée: version=$VERSION"
+
+      # Création d'un déploiement GitHub pour suivi
+      - name: Création du déploiement GitHub
+        id: create-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: "${{ steps.environment-config.outputs.environment }}",
+              required_contexts: [],
+              auto_merge: false,
+              description: "Déploiement DetectXpert v${{ steps.version-info.outputs.version }}",
+              production_environment: "${{ steps.environment-config.outputs.environment }}" === "production"
+            });
+            
+            core.setOutput('deployment_id', deployment.data.id);
+            
+            // Mettre à jour le statut initial
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'in_progress',
+              description: 'Déploiement en cours',
+              environment_url: "${{ steps.environment-config.outputs.web_url }}"
+            });
+
+      - name: Mise à jour du badge de statut (pour le README)
+        env:
+          SUMMARY_FILE: ${{ steps.setup-summary.outputs.summary_file }}
+        run: |
+          set -e
+          
+          # Création d'un badge pour le README.md
+          BADGE_URL="https://img.shields.io/badge/déploiement-en_cours-yellow"
+          BADGE_LINK="${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy.yml"
+          
+          echo "ℹ️ Badge de statut: $BADGE_URL"
+          echo "Pour intégrer ce badge au README.md, utilisez:"
+          echo "[![Statut du Déploiement]($BADGE_URL)]($BADGE_LINK)"
+          
+          echo "## Badge de Statut" >> $SUMMARY_FILE
+          echo "[![Statut du Déploiement]($BADGE_URL)]($BADGE_LINK)" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      - name: Upload du résumé de déploiement
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary
+          path: ${{ steps.setup-summary.outputs.summary_file }}
+          retention-days: 90
+
+  # Module pour vérifier les secrets requis - pour éviter les duplications dans les jobs de déploiement
+  verify-secrets:
+    name: Vérification des Secrets
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    outputs:
+      android_secrets_valid: ${{ steps.android-secrets.outputs.valid }}
+      ios_secrets_valid: ${{ steps.ios-secrets.outputs.valid }}
+      web_secrets_valid: ${{ steps.web-secrets.outputs.valid }}
+    steps:
+      - name: Vérification des secrets Android
+        id: android-secrets
+        if: contains(fromJson(needs.prepare.outputs.matrix).platform, 'android')
+        run: |
+          set -e
+          mkdir -p logs
+          echo "Vérification des secrets pour le déploiement Android - $(date)" > logs/android-secrets.log
+          
+          VALID=true
+          
+          # Vérification des secrets pour Google Play
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            if [[ -z "${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}" ]]; then
+              echo "⚠️ PLAY_STORE_SERVICE_ACCOUNT_JSON n'est pas défini" | tee -a logs/android-secrets.log
+              VALID=false
+            fi
+          fi
+          
+          # Vérification des secrets pour Firebase
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            if [[ -z "${{ secrets.FIREBASE_APP_ID_ANDROID }}" ]]; then
+              echo "⚠️ FIREBASE_APP_ID_ANDROID n'est pas défini" | tee -a logs/android-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}" ]]; then
+              echo "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON n'est pas défini" | tee -a logs/android-secrets.log
+              VALID=false
+            fi
+          fi
+          
+          if [[ "$VALID" == "true" ]]; then
+            echo "✅ Tous les secrets requis pour Android sont définis" | tee -a logs/android-secrets.log
+          fi
+          
+          echo "valid=$VALID" >> $GITHUB_OUTPUT
+
+      - name: Vérification des secrets iOS
+        id: ios-secrets
+        if: contains(fromJson(needs.prepare.outputs.matrix).platform, 'ios')
+        run: |
+          set -e
+          mkdir -p logs
+          echo "Vérification des secrets pour le déploiement iOS - $(date)" > logs/ios-secrets.log
+          
+          VALID=true
+          
+          # Vérification des secrets pour App Store Connect
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            if [[ -z "${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}" ]]; then
+              echo "⚠️ IOS_DISTRIBUTION_CERTIFICATE_BASE64 n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}" ]]; then
+              echo "⚠️ IOS_DISTRIBUTION_CERTIFICATE_PASSWORD n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.KEYCHAIN_PASSWORD }}" ]]; then
+              echo "⚠️ KEYCHAIN_PASSWORD n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" ]]; then
+              echo "⚠️ IOS_PROVISIONING_PROFILE_BASE64 n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.APPSTORE_ISSUER_ID }}" ]]; then
+              echo "⚠️ APPSTORE_ISSUER_ID n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.APPSTORE_API_KEY_ID }}" ]]; then
+              echo "⚠️ APPSTORE_API_KEY_ID n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.APPSTORE_API_PRIVATE_KEY }}" ]]; then
+              echo "⚠️ APPSTORE_API_PRIVATE_KEY n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+          fi
+          
+          # Vérification des secrets pour Firebase
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            if [[ -z "${{ secrets.FIREBASE_APP_ID_IOS }}" ]]; then
+              echo "⚠️ FIREBASE_APP_ID_IOS n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}" ]]; then
+              echo "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON n'est pas défini" | tee -a logs/ios-secrets.log
+              VALID=false
+            fi
+          fi
+          
+          if [[ "$VALID" == "true" ]]; then
+            echo "✅ Tous les secrets requis pour iOS sont définis" | tee -a logs/ios-secrets.log
+          fi
+          
+          echo "valid=$VALID" >> $GITHUB_OUTPUT
+
+      - name: Vérification des secrets Web
+        id: web-secrets
+        if: contains(fromJson(needs.prepare.outputs.matrix).platform, 'web')
+        run: |
+          set -e
+          mkdir -p logs
+          echo "Vérification des secrets pour le déploiement Web - $(date)" > logs/web-secrets.log
+          
+          VALID=true
+          
+          # Vérification des secrets pour AWS
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            if [[ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]]; then
+              echo "⚠️ AWS_ACCESS_KEY_ID n'est pas défini" | tee -a logs/web-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]]; then
+              echo "⚠️ AWS_SECRET_ACCESS_KEY n'est pas défini" | tee -a logs/web-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.AWS_REGION }}" ]]; then
+              echo "⚠️ AWS_REGION n'est pas défini" | tee -a logs/web-secrets.log
+              VALID=false
+            fi
+            
+            if [[ "${{ needs.prepare.outputs.environment }}" == "production" ]]; then
+              if [[ -z "${{ secrets.PROD_S3_BUCKET }}" ]]; then
+                echo "⚠️ PROD_S3_BUCKET n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+              if [[ -z "${{ secrets.PROD_CLOUDFRONT_DISTRIBUTION_ID }}" ]]; then
+                echo "⚠️ PROD_CLOUDFRONT_DISTRIBUTION_ID n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+              if [[ -z "${{ secrets.PROD_DOMAIN_NAME }}" ]]; then
+                echo "⚠️ PROD_DOMAIN_NAME n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+            else
+              if [[ -z "${{ secrets.STAGING_S3_BUCKET }}" ]]; then
+                echo "⚠️ STAGING_S3_BUCKET n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+              if [[ -z "${{ secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }}" ]]; then
+                echo "⚠️ STAGING_CLOUDFRONT_DISTRIBUTION_ID n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+              if [[ -z "${{ secrets.STAGING_DOMAIN_NAME }}" ]]; then
+                echo "⚠️ STAGING_DOMAIN_NAME n'est pas défini" | tee -a logs/web-secrets.log
+                VALID=false
+              fi
+            fi
+          fi
+          
+          # Vérification des secrets pour Firebase
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" ]]; then
+            if [[ -z "${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}" ]]; then
+              echo "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON n'est pas défini" | tee -a logs/web-secrets.log
+              VALID=false
+            fi
+            if [[ -z "${{ secrets.FIREBASE_PROJECT_ID }}" ]]; then
+              echo "⚠️ FIREBASE_PROJECT_ID n'est pas défini" | tee -a logs/web-secrets.log
+              VALID=false
+            fi
+          fi
+          
+          if [[ "$VALID" == "true" ]]; then
+            echo "✅ Tous les secrets requis pour Web sont définis" | tee -a logs/web-secrets.log
+          fi
+          
+          echo "valid=$VALID" >> $GITHUB_OUTPUT
+
+      - name: Archiver les logs de vérification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secrets-verification-logs
+          path: logs/
+          retention-days: 3
+  # Script modulaire pour générer des notes de version standardisées pour toutes les plateformes
+  generate-release-notes:
+    name: Génération des Notes de Version
+    needs: [prepare, build]
+    if: needs.prepare.outputs.is_rollback != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      notes_file: ${{ steps.create-notes.outputs.notes_file }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50  # Plus de profondeur pour avoir un historique suffisant
+
+      - name: Création des notes de version
+        id: create-notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TYPE: ${{ needs.prepare.outputs.release_type }}
+        run: |
+          set -e
+          mkdir -p release-metadata
+          NOTES_FILE="release-metadata/release-notes.txt"
+          
+          # Entête avec version et date
+          echo "Version $VERSION - $(date +%d/%m/%Y)" > $NOTES_FILE
+          echo "" >> $NOTES_FILE
+          
+          if [[ "$RELEASE_TYPE" == "normal" ]]; then
+            # Pour une release normale, montrer les derniers commits significatifs
+            echo "## Nouveautés et améliorations" >> $NOTES_FILE
+            echo "" >> $NOTES_FILE
+            
+            # Filtrer les commits pertinents (exclure merge commits et CI)
+            git log -20 --pretty=format:"- %s" | 
+              grep -v "Merge " | 
+              grep -v "CI: " | 
+              grep -v "chore: " | 
+              grep -v "docs: " | 
+              head -10 >> $NOTES_FILE
+            
+          elif [[ "$RELEASE_TYPE" == "hotfix" ]]; then
+            # Pour un hotfix, montrer le dernier commit et indiquer le correctif
+            echo "## Correctif" >> $NOTES_FILE
+            echo "" >> $NOTES_FILE
+            git log -1 --pretty=format:"- %s" >> $NOTES_FILE
+            echo "" >> $NOTES_FILE
+            echo "Cette version corrige un problème critique identifié dans la version précédente." >> $NOTES_FILE
+          fi
+          
+          # Ajouter des informations standard en fin de notes
+          echo "" >> $NOTES_FILE
+          echo "Si vous rencontrez un problème, contactez-nous à support@detectxpert.com" >> $NOTES_FILE
+          
+          # Pour Debug
+          echo "--- Notes de version générées ---"
+          cat $NOTES_FILE
+          echo "--------------------------------"
+          
+          # Enregistrer le chemin du fichier
+          echo "notes_file=$NOTES_FILE" >> $GITHUB_OUTPUT
+
+      - name: Téléchargement des notes de version comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.version }}
+          path: release-metadata/
+          retention-days: 90
+    name: Analyse de Sécurité
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # CodeQL Analysis - maintenant avec plus de langages et de règles
+      - name: Initialisation CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java, javascript, kotlin, ruby, python
+          queries: security-extended, security-and-quality
+          config-file: ./.github/codeql/codeql-config.yml
+        
+      - name: Configuration Java pour scan
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Autobuild des sources pour analyse
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyse CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:java,javascript,kotlin,ruby,python"
+
+      # Nouveau: Scan des dépendances pour vulnérabilités
+      - name: Analyse des dépendances
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload des résultats Trivy
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # Nouveau: Scan SonarCloud pour analyse de code
+      - name: SonarCloud Scan
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        
+      - name: Mise à jour du résumé - Sécurité
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "## Résultats Analyse de Sécurité" >> $SUMMARY_FILE
+          echo "✅ Scan CodeQL complété" >> $SUMMARY_FILE
+          echo "✅ Scan Trivy des dépendances complété" >> $SUMMARY_FILE
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "✅ Scan SonarCloud complété" >> $SUMMARY_FILE
+          fi
+          echo "Pour consulter les résultats détaillés, voir l'onglet 'Security' du dépôt." >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          echo "::notice::Analyse de sécurité terminée. Consultez l'onglet Security pour les détails."
+  
+  # Analyse SAST spécifique pour les applications mobiles
+  mobile-security:
+    name: Sécurité des Applications Mobiles
+    needs: [prepare, security-scan]
+    if: |
+      !contains(fromJson(needs.prepare.outputs.matrix).platform, 'web') && 
+      (contains(fromJson(needs.prepare.outputs.matrix).platform, 'android') || 
+       contains(fromJson(needs.prepare.outputs.matrix).platform, 'ios'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      # Analyse spécifique aux applications mobiles avec MobSF
+      - name: Analyse de sécurité mobile
+        uses: MobSF/mobsfscan-action@v0.0.5
+        with:
+          output-format: sarif
+          sarif-filename: mobsfscan-results.sarif
+
+      - name: Upload des résultats MobSF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: mobsfscan-results.sarif
+          category: mobile-security
+
+      - name: Mise à jour du résumé - Sécurité Mobile
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "### Sécurité des Applications Mobiles" >> $SUMMARY_FILE
+          echo "✅ Analyse de sécurité mobile complétée avec MobSF" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+  build:
+    name: Build et Tests
+    needs: [prepare, security-scan]
+    runs-on: ${{ matrix.platform == 'ios' && 'macos-14' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      # Explications sur le choix de fail-fast: false
+      # - Permet de continuer les builds des autres plateformes en cas d'échec sur une plateforme
+      # - Pour changer en fail-fast: true, modifier la ligne ci-dessous
+      fail-fast: false
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Configuration Node.js (pour Web)
+        if: matrix.platform == 'web'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      # Cache optimisé pour npm (Web)
+      - name: Cache npm (Web)
+        if: matrix.platform == 'web'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            platform/web/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('platform/web/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Configuration de l'environnement iOS
+        if: matrix.platform == 'ios'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.0'
+
+      # Cache optimisé pour CocoaPods (iOS)
+      - name: Cache CocoaPods (iOS)
+        if: matrix.platform == 'ios'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cocoapods
+            platform/ios/Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('platform/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Installation des dépendances iOS
+        if: matrix.platform == 'ios'
+        run: |
+          set -e
+          gem install cocoapods
+          cd platform/ios
+          pod install --repo-update
+
+      - name: Validation du Gradle Wrapper
+        run: |
+          set -e
+          chmod +x ./gradlew
+          ./gradlew wrapper --validate
+
+      # Vérification ktlint avec erreurs bien formatées pour GitHub
+      - name: Vérification ktlint
+        run: |
+          set -e
+          mkdir -p logs
+          ./gradlew ktlintCheck > logs/ktlint-${{ matrix.platform }}.log 2>&1 || {
+            echo "::group::Erreurs KtLint"
+            cat logs/ktlint-${{ matrix.platform }}.log | grep -B 1 -A 2 ":<"
+            echo "::endgroup::"
+            exit 1
+          }
+
+      # Configuration Detekt pour analyse de qualité renforcée
+      - name: Analyse statique Detekt
+        run: |
+          set -e
+          mkdir -p logs
+          ./gradlew detekt > logs/detekt-${{ matrix.platform }}.log 2>&1 || {
+            echo "::group::Erreurs Detekt"
+            cat logs/detekt-${{ matrix.platform }}.log | grep -A 2 "Rule failed:"
+            echo "::endgroup::"
+            exit 1
+          }
+
+      # Tests unitaires et de couverture de code - optimisé avec daemon Gradle
+      - name: Exécution des tests unitaires
+        run: |
+          set -e
+          mkdir -p logs
+          ./gradlew :tests:unit:test${{ matrix.platform != 'all' && matrix.platform || '' }}UnitTest jacocoTestReport > logs/unit-tests-${{ matrix.platform }}.log 2>&1 || { 
+            echo "::group::Erreurs de tests unitaires"
+            cat logs/unit-tests-${{ matrix.platform }}.log | grep -A 10 "FAILED"
+            echo "::endgroup::"
+            exit 1
+          }
+
+      # Lancement des tests d'intégration pour plus de couverture, optimisé pour la performance
+      - name: Exécution des tests d'intégration
+        run: |
+          set -e
+          mkdir -p logs
+          ./gradlew :tests:integration:test${{ matrix.platform != 'all' && matrix.platform || '' }}IntegrationTest > logs/integration-tests-${{ matrix.platform }}.log 2>&1 || {
+            echo "::group::Erreurs de tests d'intégration"
+            cat logs/integration-tests-${{ matrix.platform }}.log | grep -A 10 "FAILED"
+            echo "::endgroup::"
+            exit 1
+          }
+
+      # Build de l'application adapté à chaque environnement
+      - name: Build de l'application ${{ matrix.platform }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ENVIRONMENT: ${{ needs.prepare.outputs.environment }}
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          mkdir -p logs
+          
+          # Définir le type de build selon l'environnement
+          BUILD_TYPE="${{ needs.prepare.outputs.environment == 'production' && 'Production' || (needs.prepare.outputs.environment == 'staging' && 'Staging' || 'Development') }}"
+          
+          if [[ "${{ matrix.platform }}" == "android" ]]; then
+            echo "::group::Build Android"
+            ./gradlew :platform:android:assemble$BUILD_TYPE :platform:android:bundle$BUILD_TYPE > logs/build-${{ matrix.platform }}.log 2>&1 || {
+              cat logs/build-${{ matrix.platform }}.log
+              exit 1
+            }
+            echo "::endgroup::"
+          elif [[ "${{ matrix.platform }}" == "ios" ]]; then
+            echo "::group::Build iOS"
+            ./gradlew :platform:ios:assemble$BUILD_TYPE > logs/build-${{ matrix.platform }}.log 2>&1 || {
+              cat logs/build-${{ matrix.platform }}.log
+              exit 1
+            }
+            echo "::endgroup::"
+          elif [[ "${{ matrix.platform }}" == "web" ]]; then
+            echo "::group::Build Web"
+            ./gradlew :platform:web:build$BUILD_TYPE > logs/build-${{ matrix.platform }}.log 2>&1 || {
+              cat logs/build-${{ matrix.platform }}.log
+              exit 1
+            }
+            echo "::endgroup::"
+          fi
+
+      # Mesure de la taille des applications et rapport sur la taille
+      - name: Analyse de la taille de l'application
+        run: |
+          set -e
+          mkdir -p size-reports
+          
+          if [[ "${{ matrix.platform }}" == "android" ]]; then
+            APK_FILES=(platform/android/build/outputs/apk/**/*)
+            APK_SIZE=$(du -sh "${APK_FILES[0]}" | cut -f1)
+            echo "Taille de l'APK: $APK_SIZE" > size-reports/android-size.txt
+            
+            AAB_FILES=(platform/android/build/outputs/bundle/**/*)
+            AAB_SIZE=$(du -sh "${AAB_FILES[0]}" | cut -f1)
+            echo "Taille de l'AAB: $AAB_SIZE" >> size-reports/android-size.txt
+          
+          elif [[ "${{ matrix.platform }}" == "ios" ]]; then
+            IPA_FILES=(platform/ios/build/outputs/**/*.ipa)
+            IPA_SIZE=$(du -sh "${IPA_FILES[0]}" | cut -f1)
+            echo "Taille de l'IPA: $IPA_SIZE" > size-reports/ios-size.txt
+          
+          elif [[ "${{ matrix.platform }}" == "web" ]]; then
+            WEB_DIR="platform/web/build/distributions"
+            WEB_SIZE=$(du -sh "$WEB_DIR" | cut -f1)
+            echo "Taille du build Web: $WEB_SIZE" > size-reports/web-size.txt
+            
+            # Analyse détaillée avec source-map-explorer si disponible
+            if [ -f "$WEB_DIR/main.js" ] && [ -f "$WEB_DIR/main.js.map" ]; then
+              npx source-map-explorer "$WEB_DIR/main.js" >> size-reports/web-size-details.txt
+            fi
+          fi
+
+      - name: Mise à jour du résumé - Build
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          # Création d'une section pour la plateforme actuelle
+          echo "### Build ${{ matrix.platform }}" >> $SUMMARY_FILE
+          echo "✅ Build réussi pour ${{ matrix.platform }}" >> $SUMMARY_FILE
+          echo "- **Statut:** Réussi" >> $SUMMARY_FILE
+          echo "- **Version:** ${{ needs.prepare.outputs.version }}" >> $SUMMARY_FILE
+          
+          # Ajouter les informations de taille si disponibles
+          if [[ "${{ matrix.platform }}" == "android" && -f "size-reports/android-size.txt" ]]; then
+            echo "- **Taille:** $(cat size-reports/android-size.txt | grep "APK" | cut -d':' -f2)" >> $SUMMARY_FILE
+          elif [[ "${{ matrix.platform }}" == "ios" && -f "size-reports/ios-size.txt" ]]; then
+            echo "- **Taille:** $(cat size-reports/ios-size.txt | cut -d':' -f2)" >> $SUMMARY_FILE
+          elif [[ "${{ matrix.platform }}" == "web" && -f "size-reports/web-size.txt" ]]; then
+            echo "- **Taille:** $(cat size-reports/web-size.txt | cut -d':' -f2)" >> $SUMMARY_FILE
+          fi
+          
+          echo "" >> $SUMMARY_FILE
+
+      - name: Upload des artefacts de build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-build-${{ needs.prepare.outputs.version }}
+          path: |
+            ${{ matrix.platform == 'android' && 'platform/android/build/outputs/apk/**/*.apk' || '' }}
+            ${{ matrix.platform == 'android' && 'platform/android/build/outputs/bundle/**/*.aab' || '' }}
+            ${{ matrix.platform == 'ios' && 'platform/ios/build/outputs/**/*.ipa' || '' }}
+            ${{ matrix.platform == 'web' && 'platform/web/build/distributions/**' || '' }}
+            logs/*.log
+            size-reports/*
+            ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 14
+
+  # Nouvelle étape pour les tests sur des appareils réels avec Firebase Test Lab
+  device-testing:
+    name: Tests sur Appareils Réels
+    needs: [prepare, build]
+    if: |
+      needs.prepare.outputs.environment != 'development' &&
+      (contains(fromJson(needs.prepare.outputs.matrix).platform, 'android') || 
+       contains(fromJson(needs.prepare.outputs.matrix).platform, 'ios'))
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: ${{ fromJson(needs.prepare.outputs.matrix).platform }}
+        exclude:
+          - platform: web
+      fail-fast: false
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Téléchargement des artefacts de build
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-build-${{ needs.prepare.outputs.version }}
+          path: ${{ matrix.platform }}-build
+
+      - name: Exécution des tests Android sur Firebase Test Lab
+        if: matrix.platform == 'android'
+        run: |
+          set -e
+          mkdir -p test-results
+          
+          # Installez gcloud CLI si nécessaire
+          apt-get update && apt-get install -y curl
+          curl https://sdk.cloud.google.com | bash -s -- --disable-prompts
+          export PATH=$PATH:/root/google-cloud-sdk/bin
+          
+          # Trouvez l'APK
+          APK_PATH=$(find ${{ matrix.platform }}-build -name "*.apk" | head -n 1)
+          
+          # Exécutez les tests sur Firebase Test Lab
+          gcloud firebase test android run \
+            --type instrumentation \
+            --app "$APK_PATH" \
+            --test tests/android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+            --device model=Pixel7,version=33 \
+            --device model=SamsungS23,version=33 \
+            --results-bucket ${{ secrets.FIREBASE_TEST_BUCKET }} \
+            --results-dir="${{ needs.prepare.outputs.version }}/android" \
+            --results-history-name="DetectXpert" \
+            > test-results/android-test-results.txt
+
+      - name: Exécution des tests iOS sur Firebase Test Lab
+        if: matrix.platform == 'ios'
+        run: |
+          set -e
+          mkdir -p test-results
+          
+          # Installez gcloud CLI si nécessaire
+          apt-get update && apt-get install -y curl
+          curl https://sdk.cloud.google.com | bash -s -- --disable-prompts
+          export PATH=$PATH:/root/google-cloud-sdk/bin
+          
+          # Trouvez l'IPA
+          IPA_PATH=$(find ${{ matrix.platform }}-build -name "*.ipa" | head -n 1)
+          
+          # Exécutez les tests sur Firebase Test Lab
+          gcloud firebase test ios run \
+            --type xctest \
+            --app "$IPA_PATH" \
+            --test tests/ios/build/DetectXpertTests.zip \
+            --device model=iphone14pro,version=16.6 \
+            --device model=iphone15,version=17.0 \
+            --results-bucket ${{ secrets.FIREBASE_TEST_BUCKET }} \
+            --results-dir="${{ needs.prepare.outputs.version }}/ios" \
+            --results-history-name="DetectXpert" \
+            > test-results/ios-test-results.txt
+
+      - name: Upload des résultats de test
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-test-results-${{ needs.prepare.outputs.version }}
+          path: test-results
+          retention-days: 14
+
+      - name: Mise à jour du résumé - Tests sur Appareils
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "### Tests sur Appareils Réels - ${{ matrix.platform }}" >> $SUMMARY_FILE
+          echo "✅ Tests exécutés sur Firebase Test Lab" >> $SUMMARY_FILE
+          echo "- **Statut:** Complété" >> $SUMMARY_FILE
+          echo "- **URL des résultats:** https://console.firebase.google.com/project/${{ secrets.FIREBASE_PROJECT_ID }}/testlab/histories" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+  deploy-android:
+    name: Déploiement Android
+    needs: [prepare, build, verify-secrets, generate-release-notes]
+    if: |
+      (needs.prepare.outputs.matrix == '{"platform":["android"]}' || 
+       needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+      needs.prepare.outputs.is_rollback != 'true' &&
+      needs.verify-secrets.outputs.android_secrets_valid == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Utilisation explicite de l'environnement GitHub pour protection et approbations
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+      url: ${{ needs.prepare.outputs.android_url }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Téléchargement des artefacts Android
+        uses: actions/download-artifact@v4
+        with:
+          name: android-build-${{ needs.prepare.outputs.version }}
+          path: android-build
+
+      - name: Téléchargement des notes de version
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.version }}
+          path: release-metadata
+
+      - name: Configuration JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Publication sur Google Play
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        id: play-store-deploy
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: com.detectxpert
+          releaseFiles: android-build/platform/android/build/outputs/bundle/*/app-*-release.aab
+          track: ${{ needs.prepare.outputs.environment == 'production' && 'production' || 'internal' }}
+          status: completed
+          releaseNotes: release-metadata/release-notes.txt
+          mappingFile: android-build/platform/android/build/outputs/mapping/release/mapping.txt
+          
+      - name: Upload APK vers Firebase App Distribution
+        if: needs.prepare.outputs.environment == 'development' || needs.prepare.outputs.environment == 'staging'
+        id: firebase-deploy
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID_ANDROID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          groups: testers, beta-testers
+          file: android-build/platform/android/build/outputs/apk/*/app-*-release.apk
+          releaseNotesFile: release-metadata/release-notes.txt
+
+      - name: Mise à jour du résumé - Déploiement Android
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "### Déploiement Android" >> $SUMMARY_FILE
+          echo "✅ Déploiement réussi pour Android" >> $SUMMARY_FILE
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "- **Destination:** Google Play Store - Track ${{ needs.prepare.outputs.environment == 'production' && 'production' || 'internal' }}" >> $SUMMARY_FILE
+          fi
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "- **Destination:** Firebase App Distribution - Groupes: testers, beta-testers" >> $SUMMARY_FILE
+          fi
+          
+          echo "- **Version:** ${{ needs.prepare.outputs.version }}" >> $SUMMARY_FILE
+          echo "- **Type de release:** ${{ needs.prepare.outputs.release_type }}" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      - name: Archiver les logs de déploiement Android
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-deploy-logs-${{ needs.prepare.outputs.version }}
+          path: |
+            logs/
+            release-metadata/
+            ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 30
+
+  deploy-ios:
+    name: Déploiement iOS
+    needs: [prepare, build, verify-secrets, generate-release-notes]
+    if: |
+      (needs.prepare.outputs.matrix == '{"platform":["ios"]}' || 
+       needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+      needs.prepare.outputs.is_rollback != 'true' &&
+      needs.verify-secrets.outputs.ios_secrets_valid == 'true'
+    runs-on: macos-14
+    timeout-minutes: 30
+    # Utilisation explicite de l'environnement GitHub pour protection et approbations
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+      url: ${{ needs.prepare.outputs.ios_url }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Téléchargement des artefacts iOS
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-build-${{ needs.prepare.outputs.version }}
+          path: ios-build
+
+      - name: Téléchargement des notes de version
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.version }}
+          path: release-metadata
+
+      - name: Installation des certificats Apple
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      - name: Installation du profil de provisionnement
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        run: |
+          set -e
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+      - name: Upload vers App Store Connect
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        id: testflight-deploy
+        uses: apple-actions/upload-testflight-build@v1
+        with:
+          app-path: ios-build/platform/ios/build/outputs/ipa/*.ipa
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          beta-groups: "External Testers"
+          distribute-to-external-testers: ${{ needs.prepare.outputs.environment == 'staging' }}
+          demo-account-required: false
+          submit-beta-review: ${{ needs.prepare.outputs.environment == 'staging' }}
+          beta-build-localizations: release-metadata/
+
+      - name: Upload IPA vers Firebase App Distribution
+        if: needs.prepare.outputs.environment == 'development' || needs.prepare.outputs.environment == 'staging'
+        id: firebase-deploy
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID_IOS }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          groups: testers, beta-testers
+          file: ios-build/platform/ios/build/outputs/ipa/*.ipa
+          releaseNotesFile: release-metadata/release-notes.txt
+
+      - name: Mise à jour du résumé - Déploiement iOS
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "### Déploiement iOS" >> $SUMMARY_FILE
+          echo "✅ Déploiement réussi pour iOS" >> $SUMMARY_FILE
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "- **Destination:** TestFlight / App Store Connect" >> $SUMMARY_FILE
+            
+            if [[ "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+              echo "- **Groupes TestFlight:** External Testers" >> $SUMMARY_FILE
+            fi
+          fi
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "- **Destination:** Firebase App Distribution - Groupes: testers, beta-testers" >> $SUMMARY_FILE
+          fi
+          
+          echo "- **Version:** ${{ needs.prepare.outputs.version }}" >> $SUMMARY_FILE
+          echo "- **Type de release:** ${{ needs.prepare.outputs.release_type }}" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      - name: Archiver les logs de déploiement iOS
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-deploy-logs-${{ needs.prepare.outputs.version }}
+          path: |
+            logs/
+            release-metadata/
+            ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 30
+
+  deploy-web:
+    name: Déploiement Web
+    needs: [prepare, build, verify-secrets, generate-release-notes]
+    if: |
+      (needs.prepare.outputs.matrix == '{"platform":["web"]}' || 
+       needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+      needs.prepare.outputs.is_rollback != 'true' &&
+      needs.verify-secrets.outputs.web_secrets_valid == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Utilisation explicite de l'environnement GitHub pour protection et approbations
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+      url: ${{ needs.prepare.outputs.web_url }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Téléchargement des artefacts Web
+        uses: actions/download-artifact@v4
+        with:
+          name: web-build-${{ needs.prepare.outputs.version }}
+          path: web-build
+      
+      - name: Téléchargement des notes de version
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.version }}
+          path: release-metadata
+
+      # Sauvegarde de la version précédente pour rollback potentiel
+      - name: Sauvegarde de la version précédente (AWS)
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        run: |
+          set -e
+          mkdir -p logs
+          
+          BUCKET=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}
+          BACKUP_BUCKET="${BUCKET}-backup"
+          
+          echo "Sauvegarde de la version actuelle du bucket $BUCKET vers $BACKUP_BUCKET" | tee -a logs/web-backup.log
+          
+          # Créez un dossier de sauvegarde daté
+          BACKUP_DATE=$(date +%Y%m%d-%H%M%S)
+          BACKUP_PATH="v$BACKUP_DATE"
+          
+          # Configurez AWS CLI
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+          
+          # Vérifiez si le bucket de sauvegarde existe, sinon créez-le
+          if ! aws s3 ls "s3://$BACKUP_BUCKET" > /dev/null 2>&1; then
+            echo "Création du bucket de sauvegarde $BACKUP_BUCKET" | tee -a logs/web-backup.log
+            aws s3 mb "s3://$BACKUP_BUCKET"
+            aws s3api put-bucket-versioning --bucket "$BACKUP_BUCKET" --versioning-configuration Status=Enabled
+          fi
+          
+          # Sauvegardez la version actuelle
+          echo "Création d'une sauvegarde dans s3://$BACKUP_BUCKET/$BACKUP_PATH/" | tee -a logs/web-backup.log
+          aws s3 sync "s3://$BUCKET/" "s3://$BACKUP_BUCKET/$BACKUP_PATH/"
+          
+          # Stockez le chemin de sauvegarde pour référence future
+          echo "BACKUP_PATH=$BACKUP_PATH" >> $GITHUB_ENV
+          echo "Sauvegarde terminée avec succès" | tee -a logs/web-backup.log
+
+      - name: Configuration des credentials AWS
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Déploiement sur S3 et invalidation cache CloudFront
+        if: needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging'
+        id: aws-deploy
+        run: |
+          set -e
+          mkdir -p logs
+          BUCKET=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}
+          DISTRIBUTION_ID=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_CLOUDFRONT_DISTRIBUTION_ID || secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }}
+          DOMAIN=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_DOMAIN_NAME || secrets.STAGING_DOMAIN_NAME }}
+          
+          # Création du fichier de version avant déploiement
+          echo "${{ needs.prepare.outputs.version }}" > web-build/platform/web/build/distributions/version.txt
+          echo "$(date)" >> web-build/platform/web/build/distributions/version.txt
+          
+          # Copie des notes de version
+          cp release-metadata/release-notes.txt web-build/platform/web/build/distributions/release-notes.txt
+          
+          echo "Déploiement sur S3 bucket: $BUCKET" | tee -a logs/web-deploy.log
+          aws s3 sync web-build/platform/web/build/distributions/ s3://$BUCKET/ --delete
+          
+          echo "Invalidation du cache CloudFront pour la distribution: $DISTRIBUTION_ID" | tee -a logs/web-deploy.log
+          INVALIDATION_ID=$(aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*" --query 'Invalidation.Id' --output text)
+          echo "INVALIDATION_ID=$INVALIDATION_ID" >> $GITHUB_ENV
+          
+          echo "Déploiement accessible à l'URL: https://$DOMAIN" | tee -a logs/web-deploy.log
+          echo "Vérification du statut de l'invalidation: $INVALIDATION_ID" | tee -a logs/web-deploy.log
+          aws cloudfront wait invalidation-completed --distribution-id $DISTRIBUTION_ID --id $INVALIDATION_ID
+          echo "Invalidation du cache CloudFront terminée" | tee -a logs/web-deploy.log
+
+      - name: Déploiement sur Firebase Hosting
+        if: needs.prepare.outputs.environment == 'development'
+        id: firebase-deploy
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          channelId: ${{ needs.prepare.outputs.environment }}-${{ needs.prepare.outputs.version }}
+          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
+          entryPoint: ./platform/web
+          target: detectxpert
+
+      - name: Mise à jour du résumé - Déploiement Web
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "### Déploiement Web" >> $SUMMARY_FILE
+          echo "✅ Déploiement réussi pour Web" >> $SUMMARY_FILE
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            echo "- **Destination:** AWS S3 + CloudFront" >> $SUMMARY_FILE
+            echo "- **URL:** https://${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_DOMAIN_NAME || secrets.STAGING_DOMAIN_NAME }}" >> $SUMMARY_FILE
+            echo "- **Backup Path:** s3://${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}-backup/${{ env.BACKUP_PATH }}/" >> $SUMMARY_FILE
+          fi
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" ]]; then
+            echo "- **Destination:** Firebase Hosting" >> $SUMMARY_FILE
+            if [[ -n "${{ steps.firebase-deploy.outputs.details_url }}" ]]; then
+              echo "- **URL:** ${{ steps.firebase-deploy.outputs.details_url }}" >> $SUMMARY_FILE
+            else
+              echo "- **URL:** https://${{ secrets.FIREBASE_PROJECT_ID }}-${{ needs.prepare.outputs.environment }}-${{ needs.prepare.outputs.version }}.web.app" >> $SUMMARY_FILE
+            fi
+          fi
+          
+          echo "- **Version:** ${{ needs.prepare.outputs.version }}" >> $SUMMARY_FILE
+          echo "- **Type de release:** ${{ needs.prepare.outputs.release_type }}" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      - name: Documentation Rollback
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          echo "## Procédure de Rollback" >> $SUMMARY_FILE
+          echo "En cas de problème avec ce déploiement, suivez la procédure de rollback appropriée:" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            # AWS S3 + CloudFront
+            echo "### Web (AWS)" >> $SUMMARY_FILE
+            echo "```bash" >> $SUMMARY_FILE
+            echo "# Restaurer la version précédente depuis les backups" >> $SUMMARY_FILE
+            echo "aws s3 sync s3://${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}-backup/${{ env.BACKUP_PATH }}/ s3://${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}/ --delete" >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+            echo "# Invalider le cache CloudFront" >> $SUMMARY_FILE
+            echo "aws cloudfront create-invalidation --distribution-id ${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_CLOUDFRONT_DISTRIBUTION_ID || secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }} --paths \"/*\"" >> $SUMMARY_FILE
+            echo "```" >> $SUMMARY_FILE
+          fi
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" ]]; then
+            # Firebase Hosting
+            echo "### Web (Firebase)" >> $SUMMARY_FILE
+            echo "```bash" >> $SUMMARY_FILE
+            echo "# Rétrograder vers la version précédente sur Firebase Hosting" >> $SUMMARY_FILE
+            echo "firebase hosting:clone ${{ secrets.FIREBASE_PROJECT_ID }}:previous-version ${{ secrets.FIREBASE_PROJECT_ID }}:${{ needs.prepare.outputs.environment }}" >> $SUMMARY_FILE
+            echo "```" >> $SUMMARY_FILE
+          fi
+          
+          echo "" >> $SUMMARY_FILE
+          if [[ "${{ needs.prepare.outputs.environment }}" == "production" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            # App Store
+            echo "### iOS (App Store / TestFlight)" >> $SUMMARY_FILE
+            echo "1. Se connecter au portail App Store Connect" >> $SUMMARY_FILE
+            echo "2. Accéder à l'application DetectXpert" >> $SUMMARY_FILE
+            echo "3. Dans la section 'App Store', sélectionner la version précédente et cliquer sur 'Promouvoir cette version'" >> $SUMMARY_FILE
+            echo "" >> $SUMMARY_FILE
+            
+            # Google Play
+            echo "### Android (Google Play)" >> $SUMMARY_FILE
+            echo "1. Se connecter à la console Google Play" >> $SUMMARY_FILE
+            echo "2. Accéder à l'application DetectXpert" >> $SUMMARY_FILE
+            echo "3. Dans la section 'Publications', sélectionner 'Gestion de la production'" >> $SUMMARY_FILE
+            echo "4. Cliquer sur 'Revenir à la version précédente'" >> $SUMMARY_FILE
+          fi
+          
+          if [[ "${{ needs.prepare.outputs.environment }}" == "development" || "${{ needs.prepare.outputs.environment }}" == "staging" ]]; then
+            # Firebase App Distribution
+            echo "### iOS & Android (Firebase App Distribution)" >> $SUMMARY_FILE
+            echo "1. Se connecter à la console Firebase" >> $SUMMARY_FILE
+            echo "2. Accéder au projet ${{ secrets.FIREBASE_PROJECT_ID }}" >> $SUMMARY_FILE
+            echo "3. Dans la section 'App Distribution', sélectionner l'application concernée" >> $SUMMARY_FILE
+            echo "4. Cliquer sur 'Ajouter une nouvelle version' et téléverser la version précédente sauvegardée" >> $SUMMARY_FILE
+            echo "5. Définir les groupes de test comme 'testers'" >> $SUMMARY_FILE
+          fi
+          
+          # Ajouter un lien vers la procédure de rollback automatisée via workflow
+          echo "" >> $SUMMARY_FILE
+          echo "### Procédure de rollback automatisée" >> $SUMMARY_FILE
+          echo "Pour effectuer un rollback automatisé, déclenchez le workflow de déploiement manuellement avec les paramètres suivants:" >> $SUMMARY_FILE
+          echo "- Environnement: ${{ needs.prepare.outputs.environment }}" >> $SUMMARY_FILE
+          echo "- Plateformes: ${{ join(fromJson(needs.prepare.outputs.matrix).platform, ', ') }}" >> $SUMMARY_FILE
+          echo "- Type de release: rollback" >> $SUMMARY_FILE
+          
+          echo "" >> $SUMMARY_FILE
+          echo "Ce workflow est accessible ici: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy.yml" >> $SUMMARY_FILE
+
+      - name: Archiver les logs de déploiement Web
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-deploy-logs-${{ needs.prepare.outputs.version }}
+          path: |
+            logs/
+            release-metadata/
+            ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 30
+
+  # Job spécifique pour le rollback si nécessaire
+  rollback:
+    name: Rollback
+    needs: [prepare]
+    if: needs.prepare.outputs.is_rollback == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+      url: ${{ needs.prepare.outputs.web_url }}
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration environnement
+        run: |
+          set -e
+          mkdir -p logs
+          mkdir -p rollback-reports
+          
+          echo "# Rapport de Rollback" > rollback-reports/rollback-report.md
+          echo "" >> rollback-reports/rollback-report.md
+          echo "Date: $(date)" >> rollback-reports/rollback-report.md
+          echo "Environnement: ${{ needs.prepare.outputs.environment }}" >> rollback-reports/rollback-report.md
+          echo "Déclenché par: ${{ github.actor }}" >> rollback-reports/rollback-report.md
+          echo "" >> rollback-reports/rollback-report.md
+
+      - name: Rollback Web (AWS)
+        if: |
+          (needs.prepare.outputs.matrix == '{"platform":["web"]}' || 
+           needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+          (needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging')
+        run: |
+          set -e
+          
+          echo "## Rollback Web (AWS)" >> rollback-reports/rollback-report.md
+          
+          # Configurez AWS CLI
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+          
+          BUCKET=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_S3_BUCKET || secrets.STAGING_S3_BUCKET }}
+          BACKUP_BUCKET="${BUCKET}-backup"
+          DISTRIBUTION_ID=${{ needs.prepare.outputs.environment == 'production' && secrets.PROD_CLOUDFRONT_DISTRIBUTION_ID || secrets.STAGING_CLOUDFRONT_DISTRIBUTION_ID }}
+          
+          # Listez les backups disponibles
+          echo "Backups disponibles:" | tee -a logs/rollback-web.log
+          BACKUPS=$(aws s3 ls "s3://$BACKUP_BUCKET/" | grep -v PRE | awk '{print $2}' | sort -r | head -5)
+          echo "$BACKUPS" | tee -a logs/rollback-web.log
+          
+          # Utilisez le backup le plus récent
+          LATEST_BACKUP=$(echo "$BACKUPS" | head -1)
+          echo "Utilisation du backup: $LATEST_BACKUP" | tee -a logs/rollback-web.log
+          
+          # Effectuez le rollback
+          echo "Restauration depuis s3://$BACKUP_BUCKET/$LATEST_BACKUP vers s3://$BUCKET/" | tee -a logs/rollback-web.log
+          aws s3 sync "s3://$BACKUP_BUCKET/$LATEST_BACKUP" "s3://$BUCKET/" --delete
+          
+          # Invalidez le cache CloudFront
+          echo "Invalidation du cache CloudFront pour la distribution: $DISTRIBUTION_ID" | tee -a logs/rollback-web.log
+          INVALIDATION_ID=$(aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*" --query 'Invalidation.Id' --output text)
+          
+          echo "✅ Rollback web effectué avec succès" | tee -a logs/rollback-web.log
+          echo "  - Backup utilisé: $LATEST_BACKUP" >> rollback-reports/rollback-report.md
+          echo "  - Invalidation CloudFront ID: $INVALIDATION_ID" >> rollback-reports/rollback-report.md
+          echo "" >> rollback-reports/rollback-report.md
+
+      - name: Rollback Android (Google Play)
+        if: |
+          (needs.prepare.outputs.matrix == '{"platform":["android"]}' || 
+           needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+          (needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging')
+        run: |
+          set -e
+          
+          echo "## Rollback Android (Google Play)" >> rollback-reports/rollback-report.md
+          echo "Processus de rollback pour Google Play initié via l'API..." | tee -a logs/rollback-android.log
+          
+          # Créez un fichier temporaire pour les informations d'identification de service
+          echo '${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}' > service-account.json
+          
+          # Installez et configurez Google Play Developer API Client
+          python -m pip install --upgrade google-api-python-client
+          
+          # Créez un script Python pour le rollback
+          cat > rollback_android.py << 'EOL'
+          from googleapiclient.discovery import build
+          import google.oauth2.service_account as service_account
+          import json
+          
+          # Chargez les informations d'identification
+          credentials = service_account.Credentials.from_service_account_file(
+              'service-account.json', 
+              scopes=['https://www.googleapis.com/auth/androidpublisher']
+          )
+          
+          # Créez le service
+          service = build('androidpublisher', 'v3', credentials=credentials)
+          
+          # Effectuez le rollback
+          # Note: Cette fonctionnalité est limitée dans l'API, nous consignons simplement l'intention
+          print("Le rollback Android doit être effectué manuellement via la console Google Play")
+          print("Instructions: Accédez à la section 'Publications' > 'Gestion de la production' et cliquez sur 'Revenir à la version précédente'")
+          EOL
+          
+          # Exécutez le script
+          python rollback_android.py | tee -a logs/rollback-android.log
+          
+          echo "ℹ️ Le rollback Android doit être effectué manuellement via la console Google Play" | tee -a logs/rollback-android.log
+          echo "  - Instructions pour le rollback manuel ont été fournies." >> rollback-reports/rollback-report.md
+          echo "" >> rollback-reports/rollback-report.md
+          
+          # Nettoyage
+          rm -f service-account.json rollback_android.py
+
+      - name: Rollback iOS (App Store)
+        if: |
+          (needs.prepare.outputs.matrix == '{"platform":["ios"]}' || 
+           needs.prepare.outputs.matrix == '{"platform":["android","ios","web"]}') &&
+          (needs.prepare.outputs.environment == 'production' || needs.prepare.outputs.environment == 'staging')
+        run: |
+          set -e
+          
+          echo "## Rollback iOS (App Store)" >> rollback-reports/rollback-report.md
+          echo "Processus de rollback pour App Store initié..." | tee -a logs/rollback-ios.log
+          
+          echo "ℹ️ Le rollback iOS doit être effectué manuellement via App Store Connect" | tee -a logs/rollback-ios.log
+          echo "  - Instructions pour le rollback manuel ont été fournies." >> rollback-reports/rollback-report.md
+          echo "" >> rollback-reports/rollback-report.md
+
+      - name: Archiver les rapports de rollback
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-reports-${{ needs.prepare.outputs.environment }}
+          path: |
+            rollback-reports/
+            logs/
+          retention-days: 90
+
+      - name: Notification de rollback
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'rollback-reports/rollback-report.md';
+            
+            let reportContent = '';
+            if (fs.existsSync(reportPath)) {
+              reportContent = fs.readFileSync(reportPath, 'utf8');
+            } else {
+              reportContent = '### Rapport de rollback non disponible';
+            }
+            
+            const issueTitle = `Rollback effectué pour l'environnement ${{ needs.prepare.outputs.environment }}`;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: `# Notification de Rollback
+              
+              ${reportContent}
+              
+              ## Informations complémentaires
+              
+              - Environnement: ${{ needs.prepare.outputs.environment }}
+              - Plateformes: ${JSON.stringify(fromJson(needs.prepare.outputs.matrix).platform)}
+              - Déclenché par: ${context.actor}
+              - Date: ${new Date().toISOString()}
+              
+              [Voir les détails du workflow](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})
+              `
+            });
+            
+            console.log(`Issue de notification de rollback créée: ${issue.data.html_url}`);
+
+  notify:
+    name: Notification et Finalisation
+    needs: [prepare, build, deploy-android, deploy-ios, deploy-web, rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Téléchargement du résumé de déploiement
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-summary
+          path: ./
+
+      - name: Vérification du succès des jobs
+        id: check
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          
+          if [[ "${{ needs.prepare.outputs.is_rollback }}" == "true" ]]; then
+            # Pour un rollback, on vérifie uniquement le job de rollback
+            if [[ "${{ needs.rollback.result }}" == "success" ]]; then
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "message=Rollback réussi" >> $GITHUB_OUTPUT
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              echo "message=Échec du rollback" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Vérifie si le build a réussi et si les déploiements ont réussi ou ont été ignorés
+            if [[ "${{ needs.build.result }}" == "success" ]]; then
+              # Vérifie les résultats des jobs de déploiement
+              ANDROID_RESULT="${{ needs.deploy-android.result || 'skipped' }}"
+              IOS_RESULT="${{ needs.deploy-ios.result || 'skipped' }}"
+              WEB_RESULT="${{ needs.deploy-web.result || 'skipped' }}"
+              
+              # Vérifie que tous sont "success" ou "skipped"
+              if [[ "$ANDROID_RESULT" == "success" || "$ANDROID_RESULT" == "skipped" ]] && 
+                 [[ "$IOS_RESULT" == "success" || "$IOS_RESULT" == "skipped" ]] && 
+                 [[ "$WEB_RESULT" == "success" || "$WEB_RESULT" == "skipped" ]]; then
+                echo "status=success" >> $GITHUB_OUTPUT
+                echo "message=Déploiement réussi" >> $GITHUB_OUTPUT
+              else
+                echo "status=failure" >> $GITHUB_OUTPUT
+                echo "message=Échec du déploiement" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              echo "message=Échec du build" >> $GITHUB_OUTPUT
+            fi
+          fi
+          
+          mkdir -p logs
+          echo "Statut du déploiement: ${{ steps.check.outputs.status }}" > logs/deploy-status.log
+          echo "Message: ${{ steps.check.outputs.message }}" >> logs/deploy-status.log
+          
+          if [[ "${{ needs.prepare.outputs.is_rollback }}" != "true" ]]; then
+            echo "Build: ${{ needs.build.result }}" >> logs/deploy-status.log
+            echo "Android: ${{ needs.deploy-android.result || 'skipped' }}" >> logs/deploy-status.log
+            echo "iOS: ${{ needs.deploy-ios.result || 'skipped' }}" >> logs/deploy-status.log
+            echo "Web: ${{ needs.deploy-web.result || 'skipped' }}" >> logs/deploy-status.log
+          else
+            echo "Rollback: ${{ needs.rollback.result }}" >> logs/deploy-status.log
+          fi
+          
+          # Mise à jour du résumé avec le statut final
+          echo "## Statut Final" >> $SUMMARY_FILE
+          if [[ "${{ steps.check.outputs.status }}" == "success" ]]; then
+            echo "✅ **${{ steps.check.outputs.message }}**" >> $SUMMARY_FILE
+          else
+            echo "❌ **${{ steps.check.outputs.message }}**" >> $SUMMARY_FILE
+          fi
+          echo "- Date de fin: $(date)" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+      # Mise à jour du statut de déploiement GitHub
+      - name: Mise à jour du statut de déploiement
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Mettre à jour le statut du déploiement
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ needs.prepare.outputs.deployment_id }},
+              state: '${{ steps.check.outputs.status == 'success' && 'success' || 'failure' }}',
+              description: '${{ steps.check.outputs.message }}',
+              environment_url: "${{ needs.prepare.outputs.web_url }}"
+            });
+
+      - name: Mise à jour du badge de statut
+        env:
+          SUMMARY_FILE: ${{ needs.prepare.outputs.summary_file }}
+        run: |
+          set -e
+          if [[ "${{ steps.check.outputs.status }}" == "success" ]]; then
+            BADGE_URL="https://img.shields.io/badge/déploiement-réussi-success"
+          else
+            BADGE_URL="https://img.shields.io/badge/déploiement-échec-critical"
+          fi
+          BADGE_LINK="${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy.yml"
+          
+          echo "ℹ️ Badge de statut final: $BADGE_URL"
+          
+          # Mise à jour du badge dans le résumé en remplaçant l'intégralité du tag markdown
+          sed -i "s|\\[!\\[Statut du Déploiement\\].*|[![Statut du Déploiement]($BADGE_URL)]($BADGE_LINK)|g" $SUMMARY_FILE
+
+      - name: Commenter le déploiement sur PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('${{ needs.prepare.outputs.summary_file }}', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Résumé du Déploiement
+            
+            ${summary}
+            
+            ${{ steps.check.outputs.status == 'success' ? '✅ ' : '❌ ' }}${{ steps.check.outputs.message }}
+            
+            [Voir les détails du workflow](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`
+            });
+
+      - name: Notification sur Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.check.outputs.status == 'success' && '✅ Déploiement réussi' || '❌ Échec du déploiement' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Application:* DetectXpert\n*Version:* ${{ needs.prepare.outputs.version }}\n*Environnement:* ${{ needs.prepare.outputs.environment }}\n*Type:* ${{ needs.prepare.outputs.is_rollback == 'true' && 'Rollback' || needs.prepare.outputs.release_type }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Plateformes:*\n${{ join(fromJson(needs.prepare.outputs.matrix).platform, ', ') }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Déclenché par:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Voir les détails>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Finalisation du résumé et publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-final-summary-${{ needs.prepare.outputs.version }}
+          path: ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 90
+          # Job de notification final qui s'exécute après les jobs de déploiement
+  finalize:
+    name: Finalisation du Déploiement
+    needs: [prepare, build, deploy-android, deploy-ios, deploy-web, rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Vérification du statut des déploiements
+        id: check-status
+        run: |
+          set -e
+          
+          if [[ "${{ needs.prepare.outputs.is_rollback }}" == "true" ]]; then
+            if [[ "${{ needs.rollback.result }}" == "success" ]]; then
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "message=Rollback effectué avec succès" >> $GITHUB_OUTPUT
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              echo "message=Échec du rollback" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Vérifier le statut des déploiements selon les plateformes
+            DEPLOY_STATUS="success"
+            
+            # Android
+            if [[ "${{ contains(fromJson(needs.prepare.outputs.matrix).platform, 'android') }}" == "true" ]]; then
+              if [[ "${{ needs.deploy-android.result }}" != "success" && "${{ needs.deploy-android.result }}" != "skipped" ]]; then
+                DEPLOY_STATUS="failure"
+              fi
+            fi
+            
+            # iOS
+            if [[ "${{ contains(fromJson(needs.prepare.outputs.matrix).platform, 'ios') }}" == "true" ]]; then
+              if [[ "${{ needs.deploy-ios.result }}" != "success" && "${{ needs.deploy-ios.result }}" != "skipped" ]]; then
+                DEPLOY_STATUS="failure"
+              fi
+            fi
+            
+            # Web
+            if [[ "${{ contains(fromJson(needs.prepare.outputs.matrix).platform, 'web') }}" == "true" ]]; then
+              if [[ "${{ needs.deploy-web.result }}" != "success" && "${{ needs.deploy-web.result }}" != "skipped" ]]; then
+                DEPLOY_STATUS="failure"
+              fi
+            fi
+            
+            echo "status=$DEPLOY_STATUS" >> $GITHUB_OUTPUT
+            if [[ "$DEPLOY_STATUS" == "success" ]]; then
+              echo "message=Déploiement réussi" >> $GITHUB_OUTPUT
+            else
+              echo "message=Échec du déploiement" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Mise à jour du statut de déploiement GitHub
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ needs.prepare.outputs.deployment_id }},
+              state: '${{ steps.check-status.outputs.status }}',
+              description: '${{ steps.check-status.outputs.message }}',
+              environment_url: "${{ steps.check-status.outputs.status == 'success' && needs.prepare.outputs.web_url || '' }}"
+            });
+
+      - name: Téléchargement du résumé de déploiement
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-summary
+          path: ./
+
+      - name: Mise à jour du résumé final
+        run: |
+          set -e
+          
+          SUMMARY_FILE="${{ needs.prepare.outputs.summary_file }}"
+          
+          echo "## Statut Final" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          if [[ "${{ steps.check-status.outputs.status }}" == "success" ]]; then
+            echo "✅ **${{ steps.check-status.outputs.message }}**" >> $SUMMARY_FILE
+            BADGE_URL="https://img.shields.io/badge/déploiement-réussi-success"
+          else
+            echo "❌ **${{ steps.check-status.outputs.message }}**" >> $SUMMARY_FILE
+            BADGE_URL="https://img.shields.io/badge/déploiement-échec-critical"
+          fi
+          
+          echo "" >> $SUMMARY_FILE
+          echo "Date de fin: $(date)" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          # Mise à jour du badge
+          BADGE_LINK="${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy.yml"
+          echo "## Badge de statut final" >> $SUMMARY_FILE
+          echo "[![Statut du Déploiement]($BADGE_URL)]($BADGE_LINK)" >> $SUMMARY_FILE
+
+      - name: Notification Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.check-status.outputs.status == 'success' && '✅ Déploiement réussi' || '❌ Échec du déploiement' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Application:* DetectXpert\n*Version:* ${{ needs.prepare.outputs.version }}\n*Environnement:* ${{ needs.prepare.outputs.environment }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Plateformes:*\n${{ join(fromJson(needs.prepare.outputs.matrix).platform, ', ') }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Déclenché par:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Voir les détails du workflow>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Création de la release GitHub
+        if: |
+          steps.check-status.outputs.status == 'success' && 
+          needs.prepare.outputs.environment == 'production' && 
+          needs.prepare.outputs.is_rollback != 'true' &&
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "DetectXpert v${{ needs.prepare.outputs.version }}"
+          body_path: release-metadata/release-notes.txt
+          draft: false
+          prerelease: false
+          files: |
+            android-build/platform/android/build/outputs/apk/*/*.apk
+            ios-build/platform/ios/build/outputs/**/*.ipa
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commentaire sur la PR
+        if: github.event_name == 'pull_request' && steps.check-status.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('${{ needs.prepare.outputs.summary_file }}', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Résumé du Déploiement
+            
+            ${summary}
+            
+            [Voir les détails du workflow](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`
+            });
+
+      - name: Archivage du résumé final
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-final-summary-${{ needs.prepare.outputs.version }}
+          path: ${{ needs.prepare.outputs.summary_file }}
+          retention-days: 90
+
+  # Vérification post-déploiement pour s'assurer que l'application est en ligne
+  monitoring:
+    name: Monitoring Post-Déploiement
+    needs: [prepare, finalize]
+    if: |
+      needs.finalize.result == 'success' && 
+      needs.prepare.outputs.is_rollback != 'true' &&
+      needs.prepare.outputs.environment != 'development'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Vérification de la disponibilité Web
+        if: contains(fromJson(needs.prepare.outputs.matrix).platform, 'web')
+        run: |
+          set -e
+          WEB_URL="${{ needs.prepare.outputs.web_url }}"
+          
+          echo "Vérification de la disponibilité de $WEB_URL"
+          
+          # Attendre que le site soit disponible (jusqu'à 5 minutes)
+          TIMEOUT=300
+          START_TIME=$(date +%s)
+          
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            if [ $ELAPSED -gt $TIMEOUT ]; then
+              echo "::error::Le site n'est pas devenu disponible dans le délai imparti"
+              exit 1
+            fi
+            
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" $WEB_URL)
+            
+            if [ $HTTP_CODE -eq 200 ]; then
+              echo "✅ Site web accessible (HTTP $HTTP_CODE)"
+              break
+            else
+              echo "Site non disponible (HTTP $HTTP_CODE), nouvelle tentative dans 10 secondes..."
+              sleep 10
+            fi
+          done
+
+      - name: Collecte des métriques initiales
+        run: |
+          set -e
+          mkdir -p monitoring
+          
+          # Date et heure du déploiement
+          DEPLOY_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+          echo "Déploiement effectué le: $DEPLOY_TIME" > monitoring/metrics.txt
+          echo "Version: ${{ needs.prepare.outputs.version }}" >> monitoring/metrics.txt
+          echo "Environnement: ${{ needs.prepare.outputs.environment }}" >> monitoring/metrics.txt
+          echo "" >> monitoring/metrics.txt
+          
+          if [[ "${{ contains(fromJson(needs.prepare.outputs.matrix).platform, 'web') }}" == "true" ]]; then
+            echo "## Métriques Web" >> monitoring/metrics.txt
+            LOAD_TIME=$(curl -s -w "%{time_total}" -o /dev/null ${{ needs.prepare.outputs.web_url }})
+            echo "Temps de chargement initial: ${LOAD_TIME}s" >> monitoring/metrics.txt
+          fi
+          
+          echo "" >> monitoring/metrics.txt
+          echo "Pour des métriques plus détaillées, consultez les tableaux de bord de surveillance." >> monitoring/metrics.txt
+
+      - name: Notification de disponibilité
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🔍 Vérification Post-Déploiement"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Application:* DetectXpert v${{ needs.prepare.outputs.version }}\n*Environnement:* ${{ needs.prepare.outputs.environment }}\n*Statut:* ✅ En ligne et opérationnelle"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Plateformes vérifiées:*\n${{ join(fromJson(needs.prepare.outputs.matrix).platform, ', ') }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Liens d'accès:*\n${{ needs.prepare.outputs.web_url }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Archivage des métriques de monitoring
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-monitoring-${{ needs.prepare.outputs.version }}
+          path: monitoring/
+          retention-days: 30

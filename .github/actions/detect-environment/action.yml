@@ -1,0 +1,134 @@
+# Version: 1.0.0
+name: 'Detect Environment'
+description: "Détecte les caractéristiques de l'environnement d'exécution pour les workflows DetectXpert"
+author: 'DetectXpert DevOps Team'
+repository: 'https://github.com/detectxpert/devops'
+homepage: 'https://github.com/detectxpert/devops/tree/main/.github/actions/detect-environment'
+
+# Définition des ancres YAML pour la réutilisation
+x-bool-input: &bool-input
+  type: boolean
+  required: false
+
+x-string-input: &string-input
+  type: string
+  required: false
+
+inputs:
+  # Configuration générale
+  debug:
+    <<: *bool-input
+    description: 'Active le mode debug avec logs détaillés'
+    default: false
+    
+  verify_dependencies:
+    <<: *bool-input
+    description: 'Vérifier la présence des dépendances requises'
+    default: true
+    
+  output_format:
+    <<: *string-input
+    description: "Format de sortie pour les outputs: json (default), yaml, ou text"
+    default: 'json'
+      
+  # Contrôle des informations à détecter
+  detect_hardware:
+    <<: *bool-input
+    description: 'Détecter les capacités matérielles (output: hardware_info)'
+    default: true
+    
+  detect_network:
+    <<: *bool-input
+    description: 'Détecter les informations réseau (output: network_info)'
+    default: false
+    
+  detect_dependencies:
+    <<: *bool-input
+    description: 'Détecter les versions des dépendances logicielles (output: software_info)'
+    default: true
+    
+  detect_github_context:
+    <<: *bool-input
+    description: 'Détecter les informations contextuelles GitHub Actions (output: github_context)'
+    default: true
+    
+  required_dependencies:
+    <<: *string-input
+    description: 'Liste des dépendances à vérifier, séparées par des virgules (ex: jq,grep,xargs)'
+    default: 'jq,grep,xargs'
+    
+  performance_test:
+    <<: *bool-input
+    description: 'Effectuer des tests de performance simples (output: performance_metrics)'
+    default: false
+
+outputs:
+  os_info:
+    description: "Informations sur le système d'exploitation (nom, version, distribution)"
+    value: ${{ steps.detect.outputs.os_info }}
+    
+  hardware_info:
+    description: 'Informations sur le matériel (CPU, mémoire, disque)'
+    value: ${{ steps.detect.outputs.hardware_info }}
+    
+  software_info:
+    description: 'Informations sur les logiciels (versions des dépendances)'
+    value: ${{ steps.detect.outputs.software_info }}
+    
+  github_context:
+    description: 'Informations sur le contexte GitHub Actions'
+    value: ${{ steps.detect.outputs.github_context }}
+    
+  network_info:
+    description: 'Informations sur la connectivité réseau'
+    value: ${{ steps.detect.outputs.network_info }}
+    
+  performance_metrics:
+    description: 'Métriques de performance mesurées (si performance_test=true)'
+    value: ${{ steps.detect.outputs.performance_metrics }}
+    
+  is_valid:
+    description: "Indique si l'environnement répond aux exigences minimales (booléen)"
+    value: ${{ steps.detect.outputs.is_valid }}
+    
+  validation_errors:
+    description: "Liste des problèmes détectés dans l'environnement"
+    value: ${{ steps.detect.outputs.validation_errors }}
+    
+  environment_id:
+    description: "Identifiant unique pour l'environnement détecté"
+    value: ${{ steps.detect.outputs.environment_id }}
+    
+  summary:
+    description: 'Résumé des informations détectées'
+    value: ${{ steps.detect.outputs.summary }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Valider le format de sortie
+      if: ${{ inputs.output_format != 'json' && inputs.output_format != 'yaml' && inputs.output_format != 'text' }}
+      shell: bash
+      run: |
+        echo "::error::Format de sortie invalide : '${{ inputs.output_format }}'. Valeurs autorisées: json, yaml, text"
+        exit 1
+    
+    - name: Détecter l'environnement
+      id: detect
+      shell: bash
+      env:
+        DETECT_INPUTS: ${{ toJSON(inputs) }}
+        DETECT_DEBUG: ${{ inputs.debug }}
+        DETECT_OUTPUT_FORMAT: ${{ inputs.output_format }}
+      run: ${{ github.action_path }}/detect-environment.sh
+
+branding:
+  icon: 'server'
+  color: 'blue'
+
+# Exemples d'utilisation simples:
+# - uses: detectxpert/devops/.github/actions/detect-environment@v1.0.0
+# - id: env-info
+#   uses: detectxpert/devops/.github/actions/detect-environment@v1.0.0
+#   with:
+#     output_format: yaml

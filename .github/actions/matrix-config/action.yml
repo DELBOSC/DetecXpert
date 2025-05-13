@@ -1,0 +1,384 @@
+# Exemple d'utilisation :
+#
+# jobs:
+#   matrix-job:
+#     runs-on: ubuntu-latest
+#     outputs:
+#       matrix: ${{ steps.matrix.outputs.matrix }}
+#     steps:
+#       - uses: actions/checkout@v3
+#       - id: matrix
+#         uses: ./.github/actions/matrix-config
+#         with:
+#           platforms: android,ios
+#           dimensions: |
+#             [{"name":"arch","values":["arm64","x86_64"]}]
+#           exclude-patterns: |
+#             [{"platform":"ios","arch":"arm64"}]
+#
+#   build:
+#     needs: matrix-job
+#     strategy:
+#       matrix: ${{ fromJson(needs.matrix-job.outputs.matrix) }}
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: echo "Building for ${{ matrix.platform }}"
+
+name: 'Matrix Configuration Generator'
+description: 'Génère une configuration de matrice dynamique pour les workflows CI/CD de DetectXpert'
+author: 'Équipe DetectXpert'
+
+inputs:
+  config-type:
+    type: string
+    description: 'Type de configuration de matrice (build, test, deploy)'
+    required: true
+    default: 'build'
+    allowed-values:
+      - build
+      - test
+      - deploy
+  platforms:
+    type: string
+    description: 'Liste des plateformes séparées par des virgules (android, ios, web, desktop)'
+    required: false
+    default: 'android,ios,web,desktop'
+    pattern: '^(android|ios|web|desktop)(,(android|ios|web|desktop))*$'
+  os-versions:
+    type: string
+    description: >-
+      Liste des versions d'OS séparées par des virgules.
+      Si vide, utilisation des valeurs par défaut par plateforme :
+      - Android: 24,26,29,31,33
+      - iOS: 14,15,16
+      - Web et Desktop: latest
+    required: false
+    default: ''
+  api-levels:
+    type: string
+    description: 'Liste des niveaux d''API Android séparés par des virgules'
+    required: false
+    default: '24,26,29,31,33'
+    pattern: '^[0-9]+(,[0-9]+)*$'
+  ios-versions:
+    type: string
+    description: 'Liste des versions iOS séparées par des virgules'
+    required: false
+    default: '14,15,16'
+    pattern: '^[0-9]+(,[0-9]+)*$'
+  include-flavors:
+    type: boolean
+    description: 'Inclure les product flavors dans la matrice'
+    required: false
+    default: true
+  flavors:
+    type: string
+    description: 'Liste des product flavors séparées par des virgules'
+    required: false
+    default: 'free,premium,professional'
+    pattern: '^[a-zA-Z0-9_-]+(,[a-zA-Z0-9_-]+)*$'
+  include-dimensions:
+    type: boolean
+    description: 'Inclure les dimensions supplémentaires dans la matrice'
+    required: false
+    default: false
+  dimensions:
+    type: string
+    description: 'Liste des dimensions supplémentaires au format JSON. Ex: [{"name":"architecture","values":["arm64","x86"]}]'
+    required: false
+    default: '[]'
+  exclude-patterns:
+    type: string
+    description: 'Motifs d''exclusion au format JSON. Ex: [{"platform":"ios","flavor":"free"}]'
+    required: false
+    default: '[]'
+  path-prefix:
+    type: string
+    description: 'Préfixe de chemin pour les artefacts générés (doit commencer par "/" et ne pas se terminer par "/")'
+    required: false
+    default: '/build'
+    pattern: '^/[^/].*[^/]$'
+  debug:
+    type: boolean
+    description: 'Activer le mode debug pour afficher des informations supplémentaires'
+    required: false
+    default: false
+
+outputs:
+  matrix:
+    description: 'Configuration de matrice au format JSON pour utilisation dans jobs.<job_id>.strategy.matrix'
+    value: ${{ steps.generate-matrix.outputs.matrix }}
+  matrix-include:
+    description: 'Configurations supplémentaires à inclure dans la matrice'
+    value: ${{ steps.generate-matrix.outputs.matrix-include }}
+    required: false
+  matrix-exclude:
+    description: 'Configurations à exclure de la matrice'
+    value: ${{ steps.generate-matrix.outputs.matrix-exclude }}
+    required: false
+  total-combinations:
+    description: 'Nombre total de combinaisons dans la matrice'
+    value: ${{ steps.generate-matrix.outputs.total-combinations }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check prerequisites
+      shell: bash
+      run: |
+        # Rendre le script exécutable dès le début
+        chmod +x ${{ github.action_path }}/matrix-config.sh
+        
+        # Vérification de la présence de jq (v1.6+ recommandée)
+        # Compatible avec Linux, macOS et Windows (via Git Bash)
+        command -v jq >/dev/null 2>&1 || { 
+          echo "::error::[matrix-config] jq n'est pas installé sur le runner. Cette action nécessite jq (v1.6+) pour traiter les données JSON."
+          echo "::error::[matrix-config] Sur Windows, assurez-vous que jq est installé et disponible dans le PATH."
+          exit 1
+        }
+        
+        # Vérifier la version de jq
+        JQ_VERSION=$(jq --version | cut -d '-' -f2)
+        if command -v bc >/dev/null 2>&1 && [[ $(echo "$JQ_VERSION < 1.6" | bc -l) -eq 1 ]]; then
+          echo "::warning::[matrix-config] Version de jq détectée ($JQ_VERSION) est inférieure à 1.6. Certaines fonctionnalités pourraient ne pas fonctionner correctement."
+        elif [[ "$JQ_VERSION" < "1.6" ]]; then
+          # Fallback pour Windows où bc pourrait ne pas être disponible
+          echo "::warning::[matrix-config] Version de jq détectée ($JQ_VERSION) est inférieure à 1.6. Certaines fonctionnalités pourraient ne pas fonctionner correctement."
+        fi
+
+    - name: Set up environment variables
+      shell: bash
+      id: setup-env
+      run: |
+        # Définition des variables d'environnement en bloc
+        cat <<EOF >> $GITHUB_ENV
+PLATFORMS=${{ inputs.platforms }}
+API_LEVELS=${{ inputs.api-levels }}
+IOS_VERSIONS=${{ inputs.ios-versions }}
+OS_VERSIONS=${{ inputs.os-versions }}
+PATH_PREFIX=${{ inputs.path-prefix }}
+INCLUDE_FLAVORS=${{ inputs.include-flavors }}
+FLAVORS=${{ inputs.flavors }}
+INCLUDE_DIMENSIONS=${{ inputs.include-dimensions }}
+DIMENSIONS=${{ inputs.dimensions }}
+EXCLUDE_PATTERNS=${{ inputs.exclude-patterns }}
+CONFIG_TYPE=${{ inputs.config-type }}
+INPUT_DEBUG=${{ inputs.debug }}
+EOF
+
+    - name: Validate inputs
+      shell: bash
+      run: |
+        # Fonction pour le logging conditionnel en mode debug
+        log_debug() {
+          if [[ "$INPUT_DEBUG" == "true" ]]; then
+            echo "::debug::[matrix-config] $1"
+          fi
+        }
+        
+        # Fonction de validation pour liste de valeurs
+        validate_list() {
+          local list="$1"
+          local allowed_values="$2"
+          local name="$3"
+          
+          IFS=',' read -ra items <<< "$list"
+          for item in "${items[@]}"; do
+            if [[ ! " $allowed_values " =~ " $item " ]]; then
+              echo "::error::[matrix-config] $name invalide: '$item'. Valeurs autorisées: $allowed_values"
+              exit 1
+            fi
+          done
+          
+          log_debug "Validation de $name réussie: $list"
+        }
+        
+        # Fonction pour valider les entrées JSON
+        validate_json() {
+          local json="$1"
+          local name="$2"
+          
+          if ! echo "$json" | jq . >/dev/null 2>&1; then
+            echo "::error::[matrix-config] $name n'est pas un JSON valide: $json"
+            exit 1
+          fi
+          
+          log_debug "$name validé comme JSON"
+        }
+        
+        # Validation du type de configuration
+        case "$CONFIG_TYPE" in
+          build|test|deploy) ;;
+          *)
+            echo "::error::[matrix-config] config-type invalide: $CONFIG_TYPE. Valeurs autorisées: build, test, deploy"
+            exit 1
+            ;;
+        esac
+        log_debug "CONFIG_TYPE valide: $CONFIG_TYPE"
+        
+        # Validation des plateformes (déjà validé par le pattern GitHub)
+        log_debug "PLATFORMS validé par le pattern GitHub: $PLATFORMS"
+        
+        # Validation des niveaux d'API Android (déjà validé par le pattern GitHub)
+        log_debug "API_LEVELS validé par le pattern GitHub: $API_LEVELS"
+        
+        # Validation des versions iOS (déjà validé par le pattern GitHub)
+        log_debug "IOS_VERSIONS validé par le pattern GitHub: $IOS_VERSIONS"
+        
+        # Validation du path-prefix (déjà validé par le pattern GitHub)
+        log_debug "PATH_PREFIX validé par le pattern GitHub: $PATH_PREFIX"
+        
+        # Validation des inputs JSON avec la fonction helper
+        validate_json "$DIMENSIONS" "dimensions"
+        validate_json "$EXCLUDE_PATTERNS" "exclude-patterns"
+        
+        # Validation des valeurs booléennes
+        case "$INCLUDE_FLAVORS" in
+          true|false) ;;
+          *)
+            echo "::error::[matrix-config] include-flavors doit être 'true' ou 'false', valeur actuelle: $INCLUDE_FLAVORS"
+            exit 1
+            ;;
+        esac
+        log_debug "INCLUDE_FLAVORS valide: $INCLUDE_FLAVORS"
+        
+        case "$INCLUDE_DIMENSIONS" in
+          true|false) ;;
+          *)
+            echo "::error::[matrix-config] include-dimensions doit être 'true' ou 'false', valeur actuelle: $INCLUDE_DIMENSIONS"
+            exit 1
+            ;;
+        esac
+        log_debug "INCLUDE_DIMENSIONS valide: $INCLUDE_DIMENSIONS"
+        
+        # Vérifier si os-versions est vide
+        if [[ -z "$OS_VERSIONS" ]]; then
+          echo "os-versions est vide, utilisation des valeurs par défaut spécifiques à chaque plateforme:"
+          echo "- Android: 24,26,29,31,33"
+          echo "- iOS: 14,15,16"
+          echo "- Web et Desktop: latest"
+          
+          # Note importante pour le script matrix-config.sh :
+          # Dans matrix-config.sh, il faut implémenter un case pour chaque plateforme
+          # afin d'appliquer automatiquement les valeurs par défaut quand OS_VERSIONS est vide
+          # Exemple :
+          # if [[ -z "$OS_VERSIONS" ]]; then
+          #   for platform in ${PLATFORMS//,/ }; do
+          #     case "$platform" in
+          #       android) ... ;;
+          #       ios) ... ;;
+          #       web|desktop) ... ;;
+          #     esac
+          #   done
+          # fi
+          
+          log_debug "OS_VERSIONS est vide, les valeurs par défaut seront appliquées par plateforme"
+        else
+          log_debug "OS_VERSIONS spécifié: $OS_VERSIONS"
+        fi
+        
+        echo "Validation des inputs terminée avec succès."
+
+    - name: Display configuration parameters
+      shell: bash
+      run: |
+        echo "::group::Matrix Configuration Input Parameters"
+        echo "config-type: $CONFIG_TYPE"
+        echo "platforms: $PLATFORMS"
+        echo "os-versions: $OS_VERSIONS (vide = utiliser valeurs par défaut)"
+        echo "api-levels: $API_LEVELS"
+        echo "ios-versions: $IOS_VERSIONS"
+        echo "include-flavors: $INCLUDE_FLAVORS"
+        echo "flavors: $FLAVORS"
+        echo "include-dimensions: $INCLUDE_DIMENSIONS"
+        echo "dimensions: $DIMENSIONS"
+        echo "exclude-patterns: $EXCLUDE_PATTERNS"
+        echo "path-prefix: $PATH_PREFIX"
+        echo "debug: $INPUT_DEBUG"
+        echo "::endgroup::"
+
+    - name: Generate matrix configuration
+      id: generate-matrix
+      shell: bash
+      run: |
+        # Fonction pour le logging conditionnel en mode debug
+        log_debug() {
+          if [[ "$INPUT_DEBUG" == "true" ]]; then
+            echo "::debug::[matrix-config] $1"
+          fi
+        }
+        
+        log_debug "Début de la génération de la matrice avec matrix-config.sh"
+        
+        # Exécuter le script avec gestion des erreurs
+        set +e
+        ${{ github.action_path }}/matrix-config.sh \
+          --config-type "$CONFIG_TYPE" \
+          --platforms "$PLATFORMS" \
+          --os-versions "$OS_VERSIONS" \
+          --api-levels "$API_LEVELS" \
+          --ios-versions "$IOS_VERSIONS" \
+          --include-flavors "$INCLUDE_FLAVORS" \
+          --flavors "$FLAVORS" \
+          --include-dimensions "$INCLUDE_DIMENSIONS" \
+          --dimensions "$DIMENSIONS" \
+          --exclude-patterns "$EXCLUDE_PATTERNS" \
+          --path-prefix "$PATH_PREFIX" \
+          $([[ "$INPUT_DEBUG" == "true" ]] && echo "--debug")
+        
+        EXIT_CODE=$?
+        set -e
+        
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "::error::[matrix-config] Échec de la génération de la matrice. Code de sortie: $EXIT_CODE"
+          echo "::error::[matrix-config] Vérifiez les paramètres d'entrée et assurez-vous que les dépendances sont installées."
+          exit $EXIT_CODE
+        fi
+        
+        log_debug "Génération de la matrice terminée avec succès"
+        
+        # Traiter les outputs conditionnels
+        if [ -n "${{ steps.generate-matrix.outputs.matrix-include }}" ]; then
+          echo "matrix-include=${{ steps.generate-matrix.outputs.matrix-include }}" >> $GITHUB_OUTPUT
+          log_debug "Output matrix-include défini"
+        else
+          log_debug "Output matrix-include ignoré (vide)"
+        fi
+        
+        if [ -n "${{ steps.generate-matrix.outputs.matrix-exclude }}" ]; then
+          echo "matrix-exclude=${{ steps.generate-matrix.outputs.matrix-exclude }}" >> $GITHUB_OUTPUT
+          log_debug "Output matrix-exclude défini"
+        else
+          log_debug "Output matrix-exclude ignoré (vide)"
+        fi
+
+    - name: Display generated matrix
+      shell: bash
+      run: |
+        echo "::group::Generated Matrix Configuration"
+        
+        # Liste des outputs à afficher - permet une meilleure maintenance
+        declare -a outputs=("matrix" "matrix-include" "matrix-exclude" "total-combinations")
+        
+        # Afficher les outputs disponibles
+        for output in "${outputs[@]}"; do
+          output_value="${{ steps.generate-matrix.outputs[output] }}"
+          if [[ -n "$output_value" ]]; then
+            echo "${output}: $output_value"
+          fi
+        done
+        
+        echo "::endgroup::"
+
+# Rappels importants pour l'implémentation complète:
+# 1. Créer des tests unitaires dans un dossier tests/ avec Bats ou shunit2
+#    - Tester les validations d'entrées
+#    - Tester les cas où os-versions est vide
+#    - Tester la génération de matrice avec diverses configurations
+# 2. Ajouter un README.md à la racine de l'action contenant:
+#    - L'exemple d'utilisation du début de ce fichier
+#    - Les prérequis (jq 1.6+)
+#    - La documentation de tous les paramètres
+#    - Une explication du comportement avec os-versions vide
+#    - La mention du flag --debug
+#    - Note sur la compatibilité Windows (via Git Bash)

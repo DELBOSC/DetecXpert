@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+
+# Gestion stricte des erreurs
+set -euo pipefail
+
+# ---- Codes de sortie (readonly pour empêcher toute modification) ----
+readonly EXIT_SUCCESS=0
+readonly EXIT_GENERAL_ERROR=1
+readonly EXIT_INVALID_VERSION=2
+readonly EXIT_JSON_PARSE_ERROR=3
+readonly EXIT_INVALID_BUMP=4
+readonly EXIT_DATE_ERROR=5
+readonly EXIT_DEPENDENCY_MISSING=6
+
+# ---- Messages localisés (readonly pour sécuriser) ----
+readonly MSG_HELP_TITLE="Utilisation: version-info.sh"
+readonly MSG_HELP_ENV="Environnement:"
+readonly MSG_MODE_DRYRUN="Mode dry-run activé, les valeurs suivantes sont factices"
+readonly MSG_ERROR_MISSING_FILES="Ni gradle.properties ni Versions.kt n'existent aux emplacements spécifiés"
+readonly MSG_ERROR_NO_VERSION="Impossible d'extraire la version des fichiers spécifiés"
+readonly MSG_ERROR_INVALID_VERSION="Version extraite invalide"
+readonly MSG_USING_CUSTOM="Utilisation de la version personnalisée"
+readonly MSG_EXTRACTED_GRADLE="Version extraite de gradle.properties"
+readonly MSG_EXTRACTED_KOTLIN="Version extraite de Versions.kt"
+readonly MSG_VERSION_AFTER_BUMP="Version après bump"
+readonly MSG_WARNING_SNAPSHOT="Mode snapshot non reconnu, utilisation de 'auto'"
+readonly MSG_USING_JSON="Utilisation de la configuration JSON fournie"
+readonly MSG_WARNING_NO_JQ="jq n'est pas disponible, utilisation d'un parsing JSON simplifié (limité aux clés simples, non imbriquées)"
+readonly MSG_WARNING_COMPLEX_JSON="JSON complexe détecté avec jq non installé. Le parsing peut être imprécis. Installation de jq recommandée."
+readonly MSG_ERROR_GIT_MISSING="Git est requis mais n'est pas installé"
+readonly MSG_ERROR_INVALID_BUMP="Type de bump non reconnu"
+readonly MSG_FINAL_VERSION="Version extraite"
+readonly MSG_FINAL_CODE="Version numérique"
+readonly MSG_FINAL_SNAPSHOT="Est un snapshot"
+readonly MSG_FINAL_RELEASE="Est une release"
+
+# ---- Fonctions utilitaires ----
+
+# Fonction pour afficher l'utilisation
+usage() {
+  echo "$MSG_HELP_TITLE"
+  echo "  $MSG_HELP_ENV"
+  echo "    GRADLE_PROPERTIES_PATH: Chemin vers gradle.properties (défaut: ./gradle.properties)"
+  echo "    VERSION_FILE_PATH: Chemin vers Versions.kt (défaut: ./build-system/gradle/core/Versions.kt)"
+  echo "    CUSTOM_VERSION: Version personnalisée (optionnel)"
+  echo "    SNAPSHOT_MODE: Mode snapshot 'true', 'false', ou 'auto' (défaut: auto)"
+  echo "    VERSION_PREFIX: Préfixe de version (défaut: v)"
+  echo "    DRY_RUN: Mode simulation 'true' ou 'false' (défaut: false)"
+  echo "    BUMP: Incrémenter 'major', 'minor', ou 'patch' (optionnel)"
+  echo "    CONFIG_JSON: Configuration JSON (optionnel)"
+  echo ""
+  echo "  Codes de sortie:"
+  echo "    $EXIT_SUCCESS - Succès"
+  echo "    $EXIT_GENERAL_ERROR - Erreur générale (fichier introuvable)"
+  echo "    $EXIT_INVALID_VERSION - Format de version invalide"
+  echo "    $EXIT_JSON_PARSE_ERROR - Erreur de parsing JSON"
+  echo "    $EXIT_INVALID_BUMP - Type de bump invalide"
+  echo "    $EXIT_DATE_ERROR - Erreur dans le traitement de la date"
+  echo "    $EXIT_DEPENDENCY_MISSING - Dépendance requise manquante"
+  echo ""
+  echo "  Convention de nommage:"
+  echo "    - Les variables d'entrée sont en MAJUSCULES (CONFIG_JSON, GRADLE_PROPERTIES_PATH)"
+  echo "    - Les variables internes sont en camelCase ou snake_case (config_json, gradle_properties_path)"
+}
+
+# Fonction pour écrire dans GITHUB_OUTPUT
+write_output() {
+  local key="$1"
+  local value="$2"
+  echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+}
+
+# Fonction pour traiter la date actuelle (compatible macOS et Linux)
+get_build_date() {
+  local date_str=""
+  
+  if date -u +"%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1; then
+    # Version GNU date (Linux et certains macOS)
+    date_str=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  elif command -v gdate >/dev/null 2>&1; then
+    # Version GNU date installée via Homebrew/MacPorts sur macOS
+    date_str=$(gdate -u +"%Y-%m-%dT%H:%M:%SZ")
+  else
+    # Fallback pour macOS sans gdate
+    date_str=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+  fi
+  
+  if [[ -z "$date_str" ]]; then
+    echo "::error::Impossible de générer la date ISO" >&2
+    exit $EXIT_DATE_ERROR
+  fi
+  
+  echo "$date_str"
+}
+
+# Fonction pour obtenir le hash du commit git actuel
+get_git_commit() {
+  local commit
+  commit=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+  echo "$commit"
+}
+
+# Fonction pour obtenir la branche courante (robuste pour CI)
+get_current_branch() {
+  local branch=""
+  
+  # Essayez d'abord les variables d'environnement GitHub Actions
+  if [[ -n "${GITHUB_HEAD_REF:-}" ]]; then
+    branch="$GITHUB_HEAD_REF"
+  elif [[ -n "${GITHUB_REF:-}" && "$GITHUB_REF" == refs/heads/* ]]; then
+    branch="${GITHUB_REF#refs/heads/}"
+  else
+    # Fallback à git si pas dans GitHub Actions
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+  fi
+  
+  echo "$branch"
+}
+
+# Fonction pour valider le format de la version
+validate_version_format() {
+  local version="$1"
+  
+  # Vérifie si la version suit un format sémantique standard (éventuellement avec -SNAPSHOT)
+  if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9]+)?$ ]]; then
+    echo "::error::${MSG_ERROR_INVALID_VERSION}: $version" >&2
+    return $EXIT_INVALID_VERSION
+  fi
+  
+  return $EXIT_SUCCESS
+}
+
+# Fonction pour extraire la version depuis gradle.properties
+extract_from_gradle_properties() {
+  local file="$1"
+  local version=""
+  
+  if [[ -f "$file" ]]; then
+    # Recherche différents formats possibles de propriétés de version
+    version=$(grep -E "^version(\s*)=(\s*)(.*)" "$file" | cut -d= -f2- | tr -d ' ' | tr -d '"' | tr -d "'" || echo "")
+    if [[ -z "$version" ]]; then
+      version=$(grep -E "^VERSION_NAME(\s*)=(\s*)(.*)" "$file" | cut -d= -f2- | tr -d ' ' | tr -d '"' | tr -d "'" || echo "")
+    fi
+    if [[ -z "$version" ]]; then
+      version=$(grep -E "^appVersion(\s*)=(\s*)(.*)" "$file" | cut -d= -f2- | tr -d ' ' | tr -d '"' | tr -d "'" || echo "")
+    fi
+  fi
+  
+  echo "$version"
+}
+
+# Fonction pour extraire la version depuis Versions.kt
+extract_from_versions_kt() {
+  local file="$1"
+  local version=""
+  
+  if [[ -f "$file" ]]; then
+    # Cherche différentes définitions possibles dans le fichier Kotlin
+    version=$(grep -E "val APP_VERSION(\s*)=(\s*)(\".*\")" "$file" | sed -E 's/.*"(.*)".*/\1/' || echo "")
+    if [[ -z "$version" ]]; then
+      version=$(grep -E "const val VERSION_NAME(\s*)=(\s*)(\".*\")" "$file" | sed -E 's/.*"(.*)".*/\1/' || echo "")
+    fi
+  fi
+  
+  echo "$version"
+}
+
+# Fonction pour vérifier si c'est un snapshot basé sur le mode auto
+is_snapshot_auto() {
+  local version="$1"
+  
+  # Si la version contient déjà SNAPSHOT, c'est un snapshot
+  if [[ "$version" == *"-SNAPSHOT"* ]]; then
+    echo "true"
+    return $EXIT_SUCCESS
+  fi
+  
+  # Vérifie si nous sommes sur une branche autre que main/master
+  local current_branch
+  current_branch=$(get_current_branch)
+  if [[ -n "$current_branch" && "$current_branch" != "main" && "$current_branch" != "master" ]]; then
+    echo "true"
+    return $EXIT_SUCCESS
+  fi
+  
+  # Vérifie si nous sommes sur un tag
+  local is_on_tag="false"
+  if git describe --exact-match --tags HEAD 2>/dev/null >/dev/null; then
+    is_on_tag="true"
+  fi
+  
+  if [[ "$is_on_tag" == "false" ]]; then
+    echo "true"
+    return $EXIT_SUCCESS
+  fi
+  
+  # Par défaut, ce n'est pas un snapshot
+  echo "false"
+  return $EXIT_SUCCESS
+}
+
+# Fonction pour incrémenter la version (bump)
+bump_version() {
+  local version="$1"
+  local bump_type="$2"
+  
+  # Supprime le suffixe -SNAPSHOT s'il existe pour l'incrémentation
+  local clean_version="${version%-SNAPSHOT}"
+  
+  # Découpe la version en parties
+  local version_parts=()
+  IFS='.' read -r -a version_parts <<< "$clean_version"
+  
+  # Vérifie si nous avons 3 parties (major.minor.patch)
+  if [[ ${#version_parts[@]} -lt 3 ]]; then
+    # Ajoute des zéros pour les parties manquantes
+    while [[ ${#version_parts[@]} -lt 3 ]]; do
+      version_parts+=("0")
+    done
+  fi
+  
+  # Incrémente selon le type
+  case "$bump_type" in
+    major)
+      version_parts[0]=$((${version_parts[0]} + 1))
+      version_parts[1]=0
+      version_parts[2]=0
+      ;;
+    minor)
+      version_parts[1]=$((${version_parts[1]} + 1))
+      version_parts[2]=0
+      ;;
+    patch)
+      version_parts[2]=$((${version_parts[2]} + 1))
+      ;;
+    *)
+      echo "::error::${MSG_ERROR_INVALID_BUMP}: $bump_type" >&2
+      return $EXIT_INVALID_BUMP
+      ;;
+  esac
+  
+  # Reconstruit la version
+  echo "${version_parts[0]}.${version_parts[1]}.${version_parts[2]}"
+}
+
+# Fonction pour calculer le code de version numérique (major * 10000 + minor * 100 + patch)
+calculate_version_code() {
+  local major="$1"
+  local minor="$2"
+  local patch="$3"
+  
+  # Le préfixe 10# force l'interprétation en base 10 (évite l'interprétation en octal si commence par 0)
+  echo "$(( 10#$major * 10000 + 10#$minor * 100 + 10#$patch ))"
+}
+
+# Fonction pour parser le JSON sans jq (version simplifiée pour les clés de premier niveau uniquement)
+parse_json_value() {
+  local json="$1"
+  local key="$2"
+  
+  # Avertissement: cette méthode est limitée et peut échouer sur des valeurs JSON complexes
+  # Cette fonction est destinée UNIQUEMENT aux clés simples de premier niveau
+  # Pour des configurations JSON complexes, utilisez jq
+  
+  # Recherche pour format camelCase
+  local value=""
+  value=$(echo "$json" | grep -o "\"$key\"[^,}]*" | cut -d':' -f2- | tr -d ' "' || echo "")
+  
+  # Si rien trouvé, essaie le format kebab-case (convertit kebab-case en camelCase)
+  if [[ -z "$value" ]]; then
+    # Convertit camelCase en kebab-case pour la recherche
+    local kebab_key=""
+    kebab_key=$(echo "$key" | sed -E 's/([a-z0-9])([A-Z])/\1-\2/g' | tr '[:upper:]' '[:lower:]')
+    value=$(echo "$json" | grep -o "\"$kebab_key\"[^,}]*" | cut -d':' -f2- | tr -d ' "' || echo "")
+  fi
+  
+  echo "$value"
+}
+
+# Fonction pour gérer le mode dry-run
+handle_dry_run() {
+  echo "::notice::${MSG_MODE_DRYRUN}"
+  
+  local build_date
+  build_date=$(get_build_date)
+  local git_commit
+  git_commit=$(get_git_commit)
+  
+  write_output "version" "v0.0.0-DRYRUN"
+  write_output "version_name" "0.0.0-DRYRUN"
+  write_output "version_code" "0" 
+  write_output "major" "0"
+  write_output "minor" "0"
+  write_output "patch" "0"
+  write_output "is_snapshot" "true"
+  write_output "is_release" "false"
+  write_output "build_date" "$build_date"
+  write_output "git_commit" "$git_commit"
+  
+  exit $EXIT_SUCCESS
+}
+
+# Fonction principale
+main() {
+  # Vérification des dépendances
+  command -v git >/dev/null || { echo "::error::${MSG_ERROR_GIT_MISSING}"; exit $EXIT_DEPENDENCY_MISSING; }
+  local has_jq
+  has_jq=$(command -v jq >/dev/null && echo "true" || echo "false")
+  
+  # Vérifie si l'aide est demandée
+  if [[ "${1:-}" == "--help" ]]; then
+    usage
+    exit $EXIT_SUCCESS
+  fi
+
+  # Mode dry-run
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    handle_dry_run
+  fi
+
+  # Récupère les paramètres depuis les variables d'environnement
+  local gradle_properties_path="${GRADLE_PROPERTIES_PATH:-./gradle.properties}"
+  local version_file_path="${VERSION_FILE_PATH:-./build-system/gradle/core/Versions.kt}"
+  local custom_version="${CUSTOM_VERSION:-}"
+  local snapshot_mode="${SNAPSHOT_MODE:-auto}"
+  local version_prefix="${VERSION_PREFIX:-v}"
+  local bump="${BUMP:-}"
+
+  # Traitement du config JSON si fourni
+  if [[ -n "${CONFIG_JSON:-}" ]]; then
+    echo "${MSG_USING_JSON}"
+    
+    if [[ "$has_jq" == "true" ]]; then
+      # Vérifier si le JSON a une structure complexe (imbriquée)
+      local is_complex_json
+      is_complex_json=$(jq 'any(values | type == "object" or type == "array")' <<< "$CONFIG_JSON" 2>/dev/null || echo "false")
+      
+      # Afficher un avertissement si JSON complexe détecté
+      if [[ "$is_complex_json" == "true" ]]; then
+        echo "::warning::JSON complexe détecté, utilisation de jq pour le parsing"
+      fi
+      
+      # Extrait les valeurs du JSON avec jq
+      if jq -e '.gradlePropertiesPath' <<< "$CONFIG_JSON" &> /dev/null; then
+        gradle_properties_path=$(jq -r '.gradlePropertiesPath' <<< "$CONFIG_JSON")
+      elif jq -e '.["gradle-properties-path"]' <<< "$CONFIG_JSON" &> /dev/null; then
+        # Essaie également le format kebab-case
+        gradle_properties_path=$(jq -r '.["gradle-properties-path"]' <<< "$CONFIG_JSON")
+      fi
+      
+      if jq -e '.versionFilePath' <<< "$CONFIG_JSON" &> /dev/null; then
+        version_file_path=$(jq -r '.versionFilePath' <<< "$CONFIG_JSON")
+      elif jq -e '.["version-file-path"]' <<< "$CONFIG_JSON" &> /dev/null; then
+        version_file_path=$(jq -r '.["version-file-path"]' <<< "$CONFIG_JSON")
+      fi
+      
+      if jq -e '.customVersion' <<< "$CONFIG_JSON" &> /dev/null; then
+        custom_version=$(jq -r '.customVersion' <<< "$CONFIG_JSON")
+      elif jq -e '.["custom-version"]' <<< "$CONFIG_JSON" &> /dev/null; then
+        custom_version=$(jq -r '.["custom-version"]' <<< "$CONFIG_JSON")
+      fi
+      
+      if jq -e '.snapshot' <<< "$CONFIG_JSON" &> /dev/null; then
+        snapshot_mode=$(jq -r '.snapshot' <<< "$CONFIG_JSON")
+      fi
+      
+      if jq -e '.versionPrefix' <<< "$CONFIG_JSON" &> /dev/null; then
+        version_prefix=$(jq -r '.versionPrefix' <<< "$CONFIG_JSON")
+      elif jq -e '.["version-prefix"]' <<< "$CONFIG_JSON" &> /dev/null; then
+        version_prefix=$(jq -r '.["version-prefix"]' <<< "$CONFIG_JSON")
+      fi
+      
+      if jq -e '.bump' <<< "$CONFIG_JSON" &> /dev/null; then
+        bump=$(jq -r '.bump' <<< "$CONFIG_JSON")
+      fi
+    else
+      # Vérifiez si le JSON semble complexe (contient des objets imbriqués ou tableaux)
+      if [[ "$CONFIG_JSON" == *"{"*"{"* || "$CONFIG_JSON" == *"["*"]"* ]]; then
+        echo "::warning::${MSG_WARNING_COMPLEX_JSON}"
+      fi
+      
+      # Fallback simple si jq n'est pas disponible
+      echo "::warning::${MSG_WARNING_NO_JQ}"
+      
+      # Ces fonctions sont limitées et peuvent échouer sur des valeurs JSON complexes
+      local value=""
+      
+      value=$(parse_json_value "$CONFIG_JSON" "gradlePropertiesPath")
+      if [[ -n "$value" ]]; then
+        gradle_properties_path="$value"
+      fi
+      
+      value=$(parse_json_value "$CONFIG_JSON" "versionFilePath")
+      if [[ -n "$value" ]]; then
+        version_file_path="$value"
+      fi
+      
+      value=$(parse_json_value "$CONFIG_JSON" "customVersion")
+      if [[ -n "$value" ]]; then
+        custom_version="$value"
+      fi
+      
+      value=$(parse_json_value "$CONFIG_JSON" "snapshot")
+      if [[ -n "$value" ]]; then
+        snapshot_mode="$value"
+      fi
+      
+      value=$(parse_json_value "$CONFIG_JSON" "versionPrefix")
+      if [[ -n "$value" ]]; then
+        version_prefix="$value"
+      fi
+      
+      value=$(parse_json_value "$CONFIG_JSON" "bump")
+      if [[ -n "$value" ]]; then
+        bump="$value"
+      fi
+    fi
+  fi
+
+  # Validation de l'existence des fichiers requis
+  if [[ -z "$custom_version" ]]; then
+    if [[ ! -f "$gradle_properties_path" && ! -f "$version_file_path" ]]; then
+      echo "::error::${MSG_ERROR_MISSING_FILES}"
+      exit $EXIT_GENERAL_ERROR
+    fi
+  fi
+
+  # Déterminer la version
+  local version=""
+
+  # Utiliser la version personnalisée si fournie
+  if [[ -n "$custom_version" ]]; then
+    version="$custom_version"
+    echo "${MSG_USING_CUSTOM}: $version"
+  else
+    # Essayer d'extraire depuis gradle.properties
+    if [[ -f "$gradle_properties_path" ]]; then
+      version=$(extract_from_gradle_properties "$gradle_properties_path")
+      echo "${MSG_EXTRACTED_GRADLE}: $version"
+    fi
+    
+    # Si toujours vide, essayer Versions.kt
+    if [[ -z "$version" && -f "$version_file_path" ]]; then
+      version=$(extract_from_versions_kt "$version_file_path")
+      echo "${MSG_EXTRACTED_KOTLIN}: $version"
+    fi
+    
+    # Vérifier si nous avons une version
+    if [[ -z "$version" ]]; then
+      echo "::error::${MSG_ERROR_NO_VERSION}"
+      exit $EXIT_GENERAL_ERROR
+    fi
+  fi
+
+  # Nettoyer la version (retirer les caractères non désirés)
+  version=$(echo "$version" | tr -d ' ' | tr -d '"' | tr -d "'")
+
+  # Valider le format de la version
+  validate_version_format "$version" || exit $?
+
+  # Appliquer le bump si demandé
+  if [[ -n "$bump" ]]; then
+    version=$(bump_version "$version" "$bump") || exit $?
+    echo "${MSG_VERSION_AFTER_BUMP} ($bump): $version"
+    
+    # Valider le format de la version après bump
+    validate_version_format "$version" || exit $?
+  fi
+
+  # Décomposer la version en parties (major.minor.patch[-SNAPSHOT])
+  # Récupère la partie version sans le -SNAPSHOT
+  local version_without_snapshot="${version%-SNAPSHOT}"
+
+  # Décompose en major.minor.patch
+  local version_parts=()
+  IFS='.' read -r -a version_parts <<< "$version_without_snapshot"
+
+  # S'assure d'avoir 3 parties
+  while [[ ${#version_parts[@]} -lt 3 ]]; do
+    version_parts+=("0")
+  done
+
+  local major="${version_parts[0]}"
+  local minor="${version_parts[1]}"
+  local patch="${version_parts[2]}"
+
+  # Calcule le code de version numérique
+  local version_code
+  version_code=$(calculate_version_code "$major" "$minor" "$patch")
+
+  # Détermine si c'est un snapshot
+  local is_snapshot="false"
+
+  case "$snapshot_mode" in
+    true)
+      is_snapshot="true"
+      ;;
+    false)
+      is_snapshot="false"
+      ;;
+    auto)
+      is_snapshot=$(is_snapshot_auto "$version")
+      ;;
+    *)
+      echo "::warning::${MSG_WARNING_SNAPSHOT}: $snapshot_mode"
+      is_snapshot=$(is_snapshot_auto "$version")
+      ;;
+  esac
+
+  # Construit la version finale
+  local version_name="$version_without_snapshot"
+  if [[ "$is_snapshot" == "true" && ! "$version" == *"-SNAPSHOT"* ]]; then
+    version_name="${version_name}-SNAPSHOT"
+  elif [[ "$is_snapshot" == "false" && "$version" == *"-SNAPSHOT"* ]]; then
+    # Si on force pas de snapshot mais que la version originale en avait un
+    version_name="$version_without_snapshot"
+  fi
+
+  # Ajoute le préfixe à la version complète
+  local full_version="${version_prefix}${version_name}"
+
+  # Détermine si c'est une release
+  local is_release="false"
+  if [[ "$is_snapshot" == "false" ]]; then
+    is_release="true"
+  fi
+
+  # Obtient la date de build et le commit
+  local build_date
+  build_date=$(get_build_date)
+  local git_commit
+  git_commit=$(get_git_commit)
+
+  # Écriture des outputs
+  write_output "version" "$full_version"
+  write_output "version_name" "$version_name"
+  write_output "version_code" "$version_code"
+  write_output "major" "$major"
+  write_output "minor" "$minor"
+  write_output "patch" "$patch"
+  write_output "is_snapshot" "$is_snapshot"
+  write_output "is_release" "$is_release"
+  write_output "build_date" "$build_date"
+  write_output "git_commit" "$git_commit"
+
+  echo "${MSG_FINAL_VERSION}: $full_version"
+  echo "${MSG_FINAL_CODE}: $version_code"
+  echo "${MSG_FINAL_SNAPSHOT}: $is_snapshot"
+  echo "${MSG_FINAL_RELEASE}: $is_release"
+
+  return $EXIT_SUCCESS
+}
+
+# ==== Tests Unitaires ====
+# Pour implémenter les tests unitaires:
+# 1. Créer un répertoire 'tests/' avec les fichiers de test
+# 2. Utiliser Bats (https://github.com/bats-core/bats-core) pour écrire vos tests
+
+# Exemple de test Bats:
+# tests/version_format_test.bats
+# ```bash
+# #!/usr/bin/env bats
+# 
+# load ../version-info.sh
+# 
+# @test "Validation format version valide" {
+#   run validate_version_format "1.2.3"
+#   [ "$status" -eq 0 ]
+# }
+# 
+# @test "Validation format version invalide" {
+#   run validate_version_format "a.b.c"
+#   [ "$status" -eq 2 ]
+# }
+# ```
+#
+# Exemple de test avec HEAD détaché:
+# tests/is_snapshot_test.bats
+# ```bash
+# #!/usr/bin/env bats
+# 
+# load ../version-info.sh
+# 
+# setup() {
+#   # Sauvegarder l'état git actuel
+#   GIT_STATUS=$(git status --porcelain)
+#   ORIGINAL_HEAD=$(git rev-parse HEAD)
+# }
+# 
+# teardown() {
+#   # Restaurer l'état git original
+#   git checkout -q "$ORIGINAL_HEAD" 2>/dev/null || true
+# }
+# 
+# @test "is_snapshot_auto retourne true pour une version normale en HEAD détaché" {
+#   # Simuler un HEAD détaché (pas sur une branche ni un tag)
+#   git checkout -q HEAD~1 2>/dev/null || skip "Impossible de créer un HEAD détaché"
+#   
+#   run is_snapshot_auto "1.2.3"
+#   [ "$status" -eq 0 ]
+#   [ "$output" = "true" ]
+# }
+# ```
+#
+# Exemple de workflow GitHub Actions pour les tests:
+# ```yaml
+# # .github/workflows/test-version-info.yml
+# name: Test Version Info Action
+# 
+# on:
+#   push:
+#     paths:
+#       - '.github/actions/version-info/**'
+#   pull_request:
+#     paths:
+#       - '.github/actions/version-info/**'
+# 
+# jobs:
+#   test:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v3
+#         with:
+#           fetch-depth: 0  # Nécessaire pour tester HEAD détaché
+#       
+#       - name: Setup Bats
+#         uses: bats-core/bats-action@v2
+#         with:
+#           version: 1.8.0
+#       
+#       - name: Install jq
+#         run: sudo apt-get update && sudo apt-get install -y jq
+#       
+#       - name: Run tests
+#         run: bats .github/actions/version-info/tests/
+#       
+#       - name: ShellCheck
+#         uses: ludeeus/action-shellcheck@master
+#         with:
+#           scandir: '.github/actions/version-info'
+#           severity: warning  # Attraper également les avertissements
+# ```
+
+# Si le script est exécuté (et non sourcé), on appelle main
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
