@@ -29,7 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Vérifier prérequis
+      - name: Vérifier les prérequis
         id: check_env
         uses: ./.github/actions/detect-environment
         with:
@@ -54,10 +54,9 @@ jobs:
         id: matrix
         uses: ./.github/actions/matrix-config
         with:
-          # liste des plateformes
           platforms:       android,web
-          # mapping plateforme:OS
-          os-versions:     android:ubuntu-latest,web:macos-latest
+          # Format attendu: plateforme:versions;… (séparateur ';') :contentReference[oaicite:0]{index=0}
+          os-versions:     android:ubuntu-latest;web:macos-latest
           include-flavors: false
 
   # 3.3 Lint du code
